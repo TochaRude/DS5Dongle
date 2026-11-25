@@ -1,5 +1,9 @@
 # Pico2W DualSense 5 Bridge
 
+> [!IMPORTANT]
+> **Independent Fork Notice:** This repository ([TochaRude/DS5Dongle](https://github.com/TochaRude/DS5Dongle)) is an independent fork of [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle), developed and maintained by **TochaRude** with the assistance of **Antigravity**.
+> It is **not affiliated with, endorsed by, or developed in cooperation with** the original author (`awalol`). Please open any issues or questions regarding this fork in this repository rather than upstream.
+
 [中文](./README.CN.md)
 
 > Turn a Raspberry Pi Pico2W (or other compatible board) into a wireless adapter for the DualSense (DS5) controller.
