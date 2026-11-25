@@ -1,284 +1,129 @@
-# Pico2W DualSense 5 Bridge
+# DS5Dongle — TochaRude Fork
+
+**Turn a Raspberry Pi Pico 2 W (or compatible RP2350 board) into a low-latency wireless DualSense / DualSense Edge USB dongle.**
+
+![Platform](https://img.shields.io/badge/Platform-Pico%202%20W%20%2F%20RP2350-C51A4A?style=flat-square)
+![Upstream](https://img.shields.io/badge/Fork%20of-awalol%2FDS5Dongle-blue?style=flat-square)
+![Prebuilt](https://img.shields.io/badge/Prebuilt-ds5--bridge.uf2-brightgreen?style=flat-square)
+![License](https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square)
 
 > [!IMPORTANT]
-> **Independent Fork Notice:** This repository ([TochaRude/DS5Dongle](https://github.com/TochaRude/DS5Dongle)) is an independent fork of [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle), developed and maintained by **TochaRude** with the assistance of **Antigravity**.
-> It is **not affiliated with, endorsed by, or developed in cooperation with** the original author (`awalol`). Please open any issues or questions regarding this fork in this repository rather than upstream.
+> **Independent Fork Notice:**
+> This repository ([TochaRude/DS5Dongle](https://github.com/TochaRude/DS5Dongle)) is an **independent fork** of [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle), developed and maintained by **TochaRude** with the assistance of **Antigravity**.
+> It is **not affiliated with, endorsed by, or developed in cooperation with** the original author (`awalol`). Please open any issues or questions regarding this fork in [this repository's Issues](https://github.com/TochaRude/DS5Dongle/issues) rather than upstream.
 
-[中文](./README.CN.md)
+[What This Project Is For](#what-this-project-is-for) · [Differences from Upstream](#how-this-fork-differs-from-upstream) · [Quick Start](#quick-start) · [Controls & Configuration](#controls--configuration) · [Build from Source](#supported-boards--build-from-source) · [Credits & License](#credits--license)
 
-> Turn a Raspberry Pi Pico2W (or other compatible board) into a wireless adapter for the DualSense (DS5) controller.
+---
 
-***This repository only implements the core functionality of DS5Dongle — making a wireless controller appear as a wired
-connection. For additional features, please refer to [Community Fork](#Community-Fork)***
+## What This Project Is For
 
-## Overview
+On PC, Sony's DualSense and DualSense Edge controllers only expose their full feature set — **HD haptics, adaptive triggers, built-in speaker, 3.5 mm headset audio, and controller microphone** — over a **wired USB** connection, not over standard PC Bluetooth.
 
-This project enables the Raspberry Pi Pico2W (or other compatible board, e.g. the Waveshare RP2350B-Plus-W) to function as a Bluetooth bridge for the DualSense controller, allowing wireless connectivity with enhanced haptics support.
+**DS5Dongle** bridges that gap in hardware: the Raspberry Pi Pico 2 W pairs with your DualSense wirelessly over Bluetooth and presents itself to the host computer as a **native wired USB DualSense controller** — with no special PC drivers required and running at the **stock 150 MHz clock** (no overclocking needed).
 
-## Features
+### Core Capabilities
 
-- 🎮 Full DualSense connectivity via Pico2W (or other compatible board)
-- 🔊 Supports HD haptics (advanced vibration feedback)
-- 🎧 Headset audio output — controller speaker and 3.5 mm jack
-- 🎤 Headset microphone input — the controller mic is exposed as a USB audio input device
-- 📡 Wireless Bluetooth bridging
-- 🔘 BOOTSEL-button controller management — pair, reboot, enter BOOTSEL for flashing, or forget all pairings without unplugging
-- ⚡ Runs at the stock 150 MHz clock — no overclock required
+- **Native Wired USB Emulation** — appears to Windows/Linux/macOS games as a wired DualSense (`VID 054C` / `PID 0CE6`, or DualSense Edge)
+- **Full HD Haptics & Adaptive Triggers** — low-latency wireless bridge for game-driven tactile feedback and trigger effects
+- **USB Audio Output & Input** — supports the controller speaker, 3.5 mm headset jack, and controller microphone as standard USB audio devices
+- **Zero-Overclock Real-Time Audio Path** — Opus codec, resampler, and hot-path Bluetooth/USB handlers execute from RAM at 150 MHz
+- **Physical & Software Management** — BOOTSEL button shortcuts for pairing, switching controllers, rebooting, and entering bootloader mode
+- **Optional Shortcuts & USB Wake** — configurable button chords (up to 9 slots) and optional Wake-on-PS from S3 sleep
 
-## Getting Started
+---
 
-### Get the firmware
+## How This Fork Differs from Upstream
 
-You have two options:
+While [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle) provides the core wireless-to-USB bridge architecture, this fork keeps that lean single-controller design intact while focusing on **firmware hardening, bug fixes, memory/FIFO stability, deterministic real-time behavior, and ready-to-flash Pico 2 W binaries** — developed and verified iteratively with **Antigravity**.
 
-- **Download a pre-built `.uf2`** — grab the newest
-  [Releases](../../releases) build (`ds5-bridge-<version>.uf2`; other board
-  builds are bundled in `other board.zip`; `config_tool.py` is attached there
-  too). No tools needed.
-- **Build it yourself** — see [Build Instructions](#build-instructions)
-  below (Windows users get a one-command script).
+| Area | Upstream (`awalol/DS5Dongle`) | This Fork (`TochaRude/DS5Dongle`) |
+| --- | --- | --- |
+| **Bluetooth & CYW43 Stability** | Periodic SPI LED updates & heap-allocated feature-report map | Eliminates CYW43 LED SPI flooding, fixes `update_state` sequence counter handling, removes link-key log leaks, and replaces the heap map with a static cache + non-reentrant control TX queue |
+| **Audio, Haptics & Core Safety** | Baseline FIFO sizes and unsynchronized hot-path helpers | Deeper audio/haptics FIFOs to reduce underruns, cross-core atomics, safe UAC1 volume clamping, guarded report buffer bounds, and gated hot-path `printf` calls |
+| **Config Integrity & Commands** | Config loaded without CRC verification; incomplete `0xF6` bootloader cmd | Verifies flash config CRC32 on load, implements `0xF6` Reboot-to-BOOTSEL (`0x04`), and enables `polling_rate_mode=3` (Real-Time) in `tools/config_tool.py` |
+| **RAM Relocation & Builds** | Standard CMake Opus/SDK relocation rules | Hardened CMake Opus/SDK RAM relocations (`src/ram_mem.c`, `CMakeLists.txt`) and updated `tools/build-windows.ps1` & `tools/build-macos.sh` |
+| **Prebuilt Pico 2 W Binary** | Provided via GitHub Releases / Actions | Includes a prebuilt, verified Release UF2 ([`ds5-bridge.uf2`](./ds5-bridge.uf2)) for Raspberry Pi Pico 2 W |
 
-### Flashing Firmware
+---
 
-1. Hold the BOOTSEL button on the Pico2W
-2. Connect the Pico2W to your computer via USB
-3. The device will mount as a USB storage device
-4. Drag and drop the .uf2 firmware file onto the device
+## Quick Start
 
-> The firmware also supports a **reboot-to-BOOTSEL** command: the **Reboot to Bootloader** button in the
-> [web config](#configuration) reboots the dongle into BOOTSEL mode without holding the physical button.
+### 1. Get the Firmware
 
-### Pairing the Controller
+- Download the prebuilt Raspberry Pi Pico 2 W firmware from [Releases](https://github.com/TochaRude/DS5Dongle/releases) or directly from [`ds5-bridge.uf2`](./ds5-bridge.uf2) in this repository.
+- For other boards (Waveshare RP2350B-Plus-W, Pico W) or custom flags, see [Supported Boards & Build from Source](#supported-boards--build-from-source).
 
-1. Put the DualSense controller into Bluetooth pairing mode
-2. Wait for the Pico2W to detect and connect
-3. Once connected, the device will appear on the host system
+### 2. Flash the Pico 2 W
 
-***You may need to replug the Pico when the controller is in pairing mode.***
+1. Hold the **BOOTSEL** button on the Pico 2 W while plugging it into your PC via USB.
+2. Wait for the `RP2350` USB mass-storage drive to appear.
+3. Drag and drop `ds5-bridge.uf2` onto the drive — the Pico reboots automatically once flashing completes.
 
-### BOOTSEL button: switch, reboot, or clear controllers
+> [!TIP]
+> Once the firmware is running, you can re-enter bootloader mode without unplugging by **triple-clicking BOOTSEL**, clicking **Reboot to Bootloader** in the web config, or using `tools/reboot_bootsel.py`.
 
-While the firmware is running, the Pico's **BOOTSEL button** doubles as a
-controller and reset control — no unplugging or re-flashing needed:
+### 3. Pair Your DualSense
 
-- **Short press (click):**
-  - If a controller is connected, the current one is disconnected (its pairing is
-    kept, so it can reconnect later). Use this to free the dongle for a different
-    already-paired controller.
-  - If nothing is connected, a 30-second scan starts to pair a new controller.
-    Put the DualSense into pairing mode (hold **PS + Create/Share** until the
-    light bar flashes) while the scan runs.
-- **Double click:** **Reboot the Pico** — a normal firmware restart: re-enters
-  pairing inquiry, drops the current connection, and recovers from a transient
-  glitch. (Clicks register after a brief pause, to allow for a second/third click.)
-- **Triple click:** **Reboot into BOOTSEL** — the dongle re-enumerates as a USB
-  mass-storage drive so you can drag on a new `.uf2`, without holding BOOTSEL while
-  plugging in.
-- **Long press (~1.5 s):** Disconnect and **forget every paired controller** — all
-  stored pairings are deleted and blacklisted so they won't silently auto-reconnect,
-  even across a power cycle. The onboard LED flashes six times to confirm. To use a
-  forgotten controller again, put it back into **PS + Create/Share** pairing mode.
+1. Make sure the Pico 2 W is plugged in (if no controller is paired/connected, it automatically scans for pairing).
+2. Put your DualSense into pairing mode by holding **PS + Create (Share)** until the light bar blinks rapidly.
+3. Wait a few seconds for the connection to complete.
 
-> Triple click is a software path into the bootloader; you can also still enter it
-> the hardware way by holding BOOTSEL **while plugging in** the Pico (see
-> [Flashing Firmware](#flashing-firmware) above). All of these act on
-> click / double / triple / long-press **while the firmware is already running**.
+> [!NOTE]
+> By design, the Pico **only exposes the DualSense USB device to your PC after a controller connects** over Bluetooth. If the controller does not pair right away, short-press the BOOTSEL button to start a fresh 30-second scan or replug the Pico while the controller is blinking.
 
-## Configuration
+---
 
-You can modify the Pico settings via the web config.
+## Controls & Configuration
 
-- For release: https://ds5.awalol.eu.org
-- For development: https://ds5-dev.awalol.eu.org
+### BOOTSEL Button Controls (While Running)
 
-The **Ignore volume changes** setting (`lock_volume`) has three modes:
+| Action | Behavior |
+| --- | --- |
+| **Single click** | **Connected:** disconnects the current controller while keeping its pairing.<br>**Disconnected:** starts a 30-second scan to pair a new controller. |
+| **Double click** | **Soft reboot** — restarts the firmware and drops the active BT link. |
+| **Triple click** | **Reboot into BOOTSEL** — mounts the USB bootloader drive for flashing a new `.uf2`. |
+| **Long press (~1.5 s)** | **Forget all pairings** — clears stored pairings and blacklists auto-reconnect across power cycles (onboard LED flashes 6× to confirm). |
 
-- `0`: Off.
-- `1`: Game/software — ignore volume and mute changes in HID output reports.
-  System USB Audio controls remain available.
-- `2`: UAC (system volume) — ignore volume and mute changes through USB Audio,
-  including Windows device volume. Game/software HID controls remain available.
+### Status LED & Low-Battery Warning
 
-Both ignore modes cover the speaker, headphones and microphone. Set the desired
-device volume and mute state before ignoring UAC changes. USB Audio reads return
-the last accepted USB Audio values. The Windows slider may still move because
-the host can cache its requested value. Ignoring UAC changes cannot prevent a game or the
-Windows per-application mixer from attenuating audio samples before they reach
-the dongle.
+- **Solid ON:** normal connected operation (unless `disable_pico_led` is enabled).
+- **1 Hz Blink:** the connected DualSense battery is **≤ 10%** and not charging. This warning overrides `disable_pico_led` until the controller is plugged in or its battery recovers (disable at compile time with `-DENABLE_BATT_LED=OFF`).
 
-## Community Fork
+### Web Configurator & CLI
 
-### Audio Auto Haptics fork [loteran/DS5Dongle](https://github.com/loteran/DS5Dongle)
+- **Web Config (WebHID):** [https://ds5-dev.awalol.eu.org](https://ds5-dev.awalol.eu.org) or [https://ds5.awalol.eu.org](https://ds5.awalol.eu.org)
+- **CLI Tool:** `python tools/config_tool.py` (requires Python + HID package)
 
-> Adds real-time haptic feedback generated from game audio.
-> The Pico listens to the sound stream and converts bass and impact sounds into DualSense rumble — no game-side haptic
-> support needed.
+> Some USB interface settings (polling rate, controller mode, USB serial number, keyboard interface, or USB wake) require clicking **Reconnect USB** (or replugging the dongle) to take effect.
 
-### DS5_Bridge [SundayMoments/DS5_Bridge](https://github.com/SundayMoments/DS5_Bridge)
+<details>
+<summary><strong>Audio, Microphone & Volume Lock Modes (<code>lock_volume</code>)</strong></summary>
 
-> More customization features, such as adjusting audio, haptics, trigger strength, lighting, button remapping, and
-> shortcuts.
+- **Microphone level in Windows:** The controller microphone appears as `"Headset Microphone"`. Windows often defaults capture volume to `0` on first install — raise the recording level in Windows Sound Settings if it seems silent.
+- **Bluetooth audio caveat:** Minor audio stuttering can occasionally occur depending on Bluetooth RF environment and host load.
+- **Volume Lock (`lock_volume`) modes:**
+  - `0` — **Off:** both game HID reports and system USB Audio controls can change volume/mute.
+  - `1` — **Game / Software:** ignores volume and mute changes inside HID output reports; OS USB Audio controls still work.
+  - `2` — **UAC (System Volume):** ignores USB Audio volume/mute changes (including Windows device volume); game HID controls still work. Set your desired level before enabling mode `2`.
 
-### OLED Edition [MarcelineVPQ/DS5Dongle-OLED-Edition](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition)
+</details>
 
-> OLED Edition is a fork of awalol/DS5Dongle (upstream) that adds an optional Pico-OLED-1.3 128×64 display add-on with
-> 11 screens (status, 4-slot multi-controller pairing, lightbar color picker with favorites and effect presets, trigger
-> test, gyro tilt, touchpad, diagnostics, CPU/clock, BT signal strength, audio VU meters, and a persistent settings menu),
-> plus a DS5 button-combo soft-reboot.
+<details>
+<summary><strong>Custom Button Chords & Shortcuts (Up to 9 Slots)</strong></summary>
 
-### [artzox/DS5Dongle](https://github.com/artzox/DS5Dongle)
-
-> Building on Awalol's and Loteran's work to expand simulated haptics and add new features like 
-> native haptics anti-aliasing, audio-leak, trigger vibrations, trigger resistance, gyro-aiming, automated profile loading.
-> [Detail Introduction](https://github.com/awalol/DS5Dongle/issues/221)
-
-### DS4Dongle [snipem/DS4Dongle](https://github.com/snipem/DS4Dongle)
-
-> Firmware for the Raspberry Pi Pico 2 W that works for DualShock 4. Inspired by DS5Dongle with headset and microphone support and configuration abilities.
-
-### [zurce/DS5Dongle-OLED](https://github.com/zurce/DS5Dongle-OLED)
-
-## Notes
-
-The Pico device will only be visible to the system after the controller is connected
-
-Some behaviors depend on reconnection cycles to take effect
-
-### Microphone
-
-The controller microphone is exposed as a USB audio input — "Headset Microphone"
-on Windows. After selecting it as your recording device, raise its input/capture
-level in your OS: Windows in particular often defaults it to 0 (or very low),
-which makes the mic seem dead even though it is working.
-
-### Low-battery LED indicator
-
-When the connected DualSense reports its battery at or below 10% (and it is not charging), the Pico onboard LED switches
-from solid-on to a 1 Hz blink so you can see the warning at a glance. The LED returns to solid-on as soon as the
-controller is plugged in or its reported level rises again. The blink also fires when `disable_pico_led` is set — the
-warning is treated as critical and overrides the LED-off preference; the LED returns to its disabled (off) state once
-the battery recovers or the controller starts charging.
-
-To opt out at build time, configure with `-DENABLE_BATT_LED=OFF`. Default is ON.
-
-### Pico W Version
-
-Pico W only has haptics support, no speaker. You can enable Pico W firmware compilation with `-DPICO_W_BUILD=ON`, or
-download precompiled firmware from GitHub Actions.
-
-### Waveshare RP2350B-Plus-W
-
-The [Waveshare RP2350B-Plus-W](https://www.waveshare.com/wiki/RP2350B-Plus-W) is an RP2350B-based board with the RM2 wireless module (same CYW43 silicon as the Pico 2 W), 16 MB QSPI flash, and a USB-C connector. Build with:
-
-```
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DPICO_SDK_PATH=<sdk> -DWAVESHARE_RP2350B_PLUS_W_BUILD=ON
-cmake --build build --target ds5-bridge
-```
-
-Or download precompiled firmware from GitHub Actions.
-
-### USB Wake Feature
-
-Wake-on-PS is now built into the standard firmware — there is no separate `feat/usb-wake` branch or `ds5-bridge-wake.uf2`
-build. It is **disabled by default**; turn it on with the **Wake PC from sleep on PS button** toggle in the
-[web config](#configuration). When enabled, the dongle presents a HID keyboard interface and advertises USB remote
-wakeup so a controller button can wake the PC; when disabled, that interface is not enumerated. See
-[Wake-on-PS](#wake-on-ps-optional) for setup.
-
-It is recommended to read #60 and #61 before using this feature.
-
-## Known Issues
-
-- ⚠️ Audio may experience slight stuttering
-
-## Performance
-
-The audio path — libopus encode/decode, the resampler, and the Bluetooth/USB
-packet handling on the hot path — executes from **RAM** instead of flash. This
-removes flash-fetch (XIP cache miss) stalls from the time-critical audio loop,
-which previously forced the RP2350 to be overclocked just to keep up with audio
-encoding.
-
-As a result, the firmware runs the **full audio path (haptics, speaker, 3.5 mm
-output, and microphone) at the stock 150 MHz clock — no overclock and no
-core-voltage bump.**
-
-> Earlier releases required 320 MHz @ 1.2 V; overclocking is no longer needed.
-> If you build for a different board and it fails to boot, reduce the CPU
-> frequency (and/or raise the voltage) in `CMakeLists.txt`.
-
-## Build Instructions
-
-### Windows 11 (one command, no WSL)
-
-You don't even need to clone this repo. Download just
-[`tools/build-windows.ps1`](tools/build-windows.ps1) to any folder and run
-it in **PowerShell**:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
-```
-
-(If you already have a checkout, run `tools\build-windows.ps1` from the
-repo root instead — it detects and uses your local checkout.)
-
-The script installs every prerequisite (CMake, Ninja, Python, Git and the
-ARM GNU toolchain — via `winget`, falling back to portable downloads if
-`winget` is unavailable), clones the project (if not run from a checkout)
-plus the pinned Pico SDK + TinyUSB into `%USERPROFILE%\.ds5-build`, builds
-the firmware, and drops `ds5-bridge.uf2` next to the script and on your
-Desktop. It is safe to re-run; already-installed tools are skipped.
-
-Build a fork or a specific ref with `-Repo <url>` / `-Ref <branch|tag>`.
-
-Build a variant with `-Variant debug`.
-
-### Other platforms
-
-To build from source manually:
-
-1. Install the Pico SDK 2.3.1 and pin its TinyUSB submodule to `98741b55` — the
-   SDK's own submodule still points at TinyUSB 0.18.0, which is too old:
-
-   ```sh
-   git -C <sdk>/lib/tinyusb fetch --depth 1 origin 98741b55959564746998d0453c32d87064629d7c
-   git -C <sdk>/lib/tinyusb checkout --detach 98741b55959564746998d0453c32d87064629d7c
-   ```
-
-2. Initialise this repo's submodules: `git submodule update --init --recursive`
-3. Configure and build with the standard Pico SDK toolchain:
-   `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH=<sdk>`
-   then `cmake --build build --target ds5-bridge`
-
-On macOS, `tools/build-macos.sh` can prepare a repo-local Pico SDK checkout, prompt to install missing Homebrew build
-tools, initialize submodules, pin TinyUSB, and build the firmware:
-
-```sh
-tools/build-macos.sh
-```
-
-Use `tools/build-macos.sh --clean` to rebuild from scratch, or
-`--sdk-dir <path>` to use an existing SDK checkout. When using `--sdk-dir`, the script asks before checking that SDK out
-to the required Pico SDK and TinyUSB versions. If Homebrew's `arm-none-eabi-gcc` formula is installed without standard C
-headers, the script asks to install the complete `gcc-arm-embedded` cask and points CMake at that toolchain.
-
-## Custom button chords
-
-The Button settings support up to 9 custom shortcut mappings. Each mapping assigns a
-trigger to a keyboard shortcut, media key, or firmware action.
-
-Triggers:
-
+Trigger syntax:
 - `Button` — single tap
-- `Button*2` — double tap; two presses within 250 ms
-- `Button1+Button2` — fires when both buttons become held, and can fire again after either is released
-- `Button1+Button2*2` — requires the chord to be formed twice
+- `Button*2` — double tap within 250 ms
+- `Button1+Button2` — triggers when both buttons are held
+- `Button1+Button2*2` — chord formed twice
 
-If a button has both single- and double-tap actions, the single-tap action is delayed
-until the 250 ms window closes. Otherwise, a single tap fires immediately.
+Actions:
+- **Keyboard:** modifiers + key (e.g. `Win+Shift+S`, `Win+PrintScreen`, `Win+G`, `F13`, or raw HID usage IDs like `0x16`).
+- **Media:** `VolumeUp`, `VolumeDown`, `Mute`, `PlayPause`, `Next`, `Prev`, `Stop`, `BrightnessUp`, `BrightnessDown`.
+- **Firmware:** `bt_disconnect` (does not require USB keyboard interfaces).
 
-Use the bundled configuration tool to view or edit the slots:
+Enable `enable_keyboard=1` (and reconnect USB) for keyboard/media actions:
 
 ```sh
 python tools/config_tool.py shortcut
@@ -290,78 +135,90 @@ python tools/config_tool.py shortcut 6=PS*2:Win+Tab
 python tools/config_tool.py shortcut 1=off
 ```
 
-Multiple slot assignments can be passed in one command. Changes are saved to the Button
-sector by default; use `--no-save` for a RAM-only update.
+*Limitations:* Trigger buttons are not swallowed (games/overlays still see them); two D-pad directions cannot form a chord; Windows media volume actions adjust the DualSense audio endpoint rather than the active default output device.
 
-Actions:
+</details>
 
-- **Keyboard** — modifiers plus one key, such as `Win+Shift+S`, `Win+PrintScreen`, `Win+G`, or `F13`. Raw HID usage IDs such as `0x16` are also accepted.
-- **Media** — `VolumeUp`, `VolumeDown`, `Mute`, `PlayPause`, `Next`, `Prev`, `Stop`, `BrightnessUp`, or `BrightnessDown`. These use the Consumer Control HID interface and take no modifiers.
-- **Firmware** — `bt_disconnect` disconnects the currently connected controller.
+<details>
+<summary><strong>Optional Wake-on-PS (S3 Sleep Only)</strong></summary>
 
-Set `enable_keyboard=1` and reconnect USB to enable keyboard and media actions. Firmware
-actions do not require the USB HID interfaces.
+Enabling **Wake PC from sleep on PS button** in the config (and reconnecting USB) enumerates a boot keyboard + consumer control HID interface and advertises USB remote wakeup. Pressing a controller button while the host is in **S3 sleep** injects an **F15** keypress to wake the PC within ~1 s. *(Modern Standby / S0ix is not supported; check `powercfg /a` for `Standby (S3)`.)*
 
-Limitations:
-
-- Trigger buttons are **not swallowed**. They still reach the game, so a chord using **PS** may also open the Steam overlay or Game Bar. Prefer buttons without a global binding.
-- Two DPad directions cannot form a chord because the controller reports only one DPad direction at a time; the tool rejects such pairs.
-- Due to a Windows limitation, volume actions adjust the DualSense audio endpoint only; they cannot adjust the currently selected default audio device.
-
-## Wake-on-PS (optional)
-
-Enabling the **Wake PC from sleep on PS button** toggle in the [web config](#configuration) makes the dongle present two
-extra HID interfaces (a boot keyboard and a consumer control) and advertise USB remote wakeup. A controller button press
-while the host is suspended then injects an **F15** keypress, waking the PC from **S3 sleep**. F15 was chosen because it
-has no default Windows or app binding — a stray fire never inserts characters or triggers shortcuts. The toggle is off by
-default, and those interfaces are only enumerated while wake or the explicit `enable_keyboard` setting is enabled.
-
-Scope: **S3 only.** Modern Standby (S0ix) is not supported. To check your machine, run `powercfg /a` — you need
-"Standby (S3)" listed under available sleep states.
-
-After enabling the toggle (then **Reconnect USB** so the interface re-enumerates):
-
-1. Open Device Manager → the new **HID Keyboard Device** (and its parent **USB Composite Device**) → Properties → Power
-   Management → tick **"Allow this device to wake the computer."**
+1. In **Device Manager**, enable *"Allow this device to wake the computer"* on the new **HID Keyboard Device** and its parent **USB Composite Device**.
 2. Verify with `powercfg /devicequery wake_armed`.
-3. Sleep the PC; press any button on the controller; the PC should wake within ~1 s.
-4. After a wake, `powercfg /lastwake` should attribute the wake to the HID Keyboard Device.
+3. If `SelectiveSuspendEnabled` was not set by Windows on the audio interface (`MI_00`), apply it via elevated PowerShell (`PID_0CE6` for DualSense, `PID_0DF2` for DualSense Edge) and reconnect USB:
 
-> Wake also needs `SelectiveSuspendEnabled = 1` (a `REG_DWORD`) on the controller's audio interface (`MI_00`). Windows
-> only writes it at first install, so a runtime toggle may need it set manually. It lives under each per-instance
-> `Device Parameters` key:
->
-> ```
-> HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_054C&PID_0CE6&MI_00\<instance>\Device Parameters
->     SelectiveSuspendEnabled    (REG_DWORD) = 1
-> ```
->
-> `PID_0CE6` is the DualSense (`PID_0DF2` for the Edge), and `<instance>` is device/port-specific (e.g.
-> `6&212078ea&1&0000`), so there can be more than one node — set it on every one. An elevated PowerShell one-liner that
-> covers all present instances:
->
-> ```powershell
-> Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB\VID_054C&PID_0CE6&MI_00' | ForEach-Object {
->   New-ItemProperty "$($_.PSPath)\Device Parameters" SelectiveSuspendEnabled -Value 1 -PropertyType DWord -Force }
-> ```
->
-> Then Reconnect USB or reboot. (Re-installing the device — clearing its Windows device cache and replugging — also
-> makes Windows write the value itself.)
+```powershell
+Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB\VID_054C&PID_0CE6&MI_00' | ForEach-Object {
+  New-ItemProperty "$($_.PSPath)\Device Parameters" SelectiveSuspendEnabled -Value 1 -PropertyType DWord -Force
+}
+```
 
-## Roadmap
+</details>
 
-- Please check out [DS5Dongle plan](https://github.com/users/awalol/projects/5)
+---
 
-## Community
+## Supported Boards & Build from Source
 
-- Join the Discord server: [Discord Server](https://discord.gg/hM4ntchGCa)
-- If you have a bug, please open an issue instead.
+| Board | CMake Flag | Support Level |
+| --- | --- | --- |
+| **Raspberry Pi Pico 2 W** | *(default)* | Full support (haptics, adaptive triggers, speaker, 3.5 mm jack, mic) |
+| **Waveshare RP2350B-Plus-W** | `-DWAVESHARE_RP2350B_PLUS_W_BUILD=ON` | Full RP2350B support (16 MB flash, USB-C) |
+| **Raspberry Pi Pico W** | `-DPICO_W_BUILD=ON` | Haptics support only (no speaker/audio) |
 
-## References
+### Windows (Automated Script)
 
-- [rafaelvaloto/Pico_W-Dualsense](https://github.com/rafaelvaloto/Pico_W-Dualsense) — Project inspiration
-- [egormanga/SAxense](https://apps.sdore.me/SAxense) — Bluetooth Haptics POC
-- [https://controllers.fandom.com/wiki/Sony_DualSense](https://controllers.fandom.com/wiki/Sony_DualSense) - DualSense
-  data report structure documentation
-- [Paliverse/DualSenseX](https://github.com/Paliverse/DualSenseX) — Speaker report packet
-- [Nielk1’s research report and packet samples](https://github.com/egormanga/SAxense/issues/1)
+Run from the repository root in PowerShell (automatically handles dependencies and builds `ds5-bridge.uf2`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\build-windows.ps1
+```
+
+### macOS
+
+```sh
+tools/build-macos.sh
+```
+
+### Manual CMake Build (Linux / Cross-Platform)
+
+Requires **Pico SDK 2.3.1** with its **TinyUSB** submodule pinned to commit `98741b55959564746998d0453c32d87064629d7c`:
+
+```sh
+git -C <sdk>/lib/tinyusb fetch --depth 1 origin 98741b55959564746998d0453c32d87064629d7c
+git -C <sdk>/lib/tinyusb checkout --detach 98741b55959564746998d0453c32d87064629d7c
+git submodule update --init --recursive
+
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH=<sdk>
+cmake --build build --target ds5-bridge
+```
+
+Optional build flags: `-DVERSION=<tag>` (custom version string reported in WebHID), `-DENABLE_BATT_LED=OFF`, `-DWAVESHARE_RP2350B_PLUS_W_BUILD=ON`, `-DPICO_W_BUILD=ON`.
+
+---
+
+## Related Community Forks & References
+
+### Ecosystem Forks
+
+- **[awalol/DS5Dongle](https://github.com/awalol/DS5Dongle)** — Original upstream project
+- **[loteran/DS5Dongle](https://github.com/loteran/DS5Dongle)** — Audio-to-haptics conversion (simulated rumble from game audio)
+- **[SundayMoments/DS5_Bridge](https://github.com/SundayMoments/DS5_Bridge)** — Extended customization (lighting, trigger strength, remapping, shortcuts)
+- **[MarcelineVPQ/DS5Dongle-OLED-Edition](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition)** — Optional 128×64 OLED display add-on & diagnostics UI
+- **[artzox/DS5Dongle](https://github.com/artzox/DS5Dongle)** — Expanded simulated haptics, anti-aliasing, gyro-aiming & profiles
+- **[snipem/DS4Dongle](https://github.com/snipem/DS4Dongle)** — DualShock 4 adaptation for Pico 2 W
+
+### Technical References
+
+- [rafaelvaloto/Pico_W-Dualsense](https://github.com/rafaelvaloto/Pico_W-Dualsense) — Original inspiration
+- [egormanga/SAxense](https://apps.sdore.me/SAxense) & [Nielk1's research](https://github.com/egormanga/SAxense/issues/1) — Bluetooth Haptics POC & packet analysis
+- [Sony DualSense Wiki](https://controllers.fandom.com/wiki/Sony_DualSense) — DualSense HID report structure
+- [Paliverse/DualSenseX](https://github.com/Paliverse/DualSenseX) — Speaker report packets
+
+---
+
+## Credits & License
+
+- **Original Project & Upstream Author:** [awalol](https://github.com/awalol) and all contributors to [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle).
+- **This Fork:** Maintained independently by **TochaRude** with the assistance of **Antigravity** (no affiliation or cooperation with the original author).
+- **License:** Distributed under the [MIT License](./LICENSE).
