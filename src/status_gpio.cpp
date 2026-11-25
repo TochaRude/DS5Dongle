@@ -7,10 +7,28 @@
 #define BUTTON_PRESS_MS 200
 
 static volatile alarm_id_t button_alarm_id;
+static uint8_t initialized_pin = STATUS_GPIO_DISABLED;
+
+static void ensure_pin_initialized(const uint8_t pin) {
+    if (initialized_pin != STATUS_GPIO_DISABLED && initialized_pin != pin) {
+        gpio_put(initialized_pin, false);
+        gpio_deinit(initialized_pin);
+        initialized_pin = STATUS_GPIO_DISABLED;
+    }
+    if (pin != STATUS_GPIO_DISABLED && initialized_pin != pin) {
+        gpio_init(pin);
+        gpio_put(pin, false);
+        gpio_set_dir(pin, GPIO_OUT);
+        initialized_pin = pin;
+    }
+}
 
 bool status_gpio_pin_valid(const uint8_t pin) {
     if (pin == STATUS_GPIO_DISABLED) return true;
     if (pin >= NUM_BANK0_GPIOS) return false;
+#if defined(PICO_RP2350A) && PICO_RP2350A
+    if (pin >= 30) return false;
+#endif
 
 #ifdef PICO_DEFAULT_UART_TX_PIN
     if (pin == PICO_DEFAULT_UART_TX_PIN) return false;
@@ -53,6 +71,7 @@ void gpio_on_connect() {
     gpio_on_disconnect();
 
     const auto &config = get_config();
+    ensure_pin_initialized(config.status_gpio_pin);
     if (config.status_gpio_pin == STATUS_GPIO_DISABLED) return;
 
     gpio_put(config.status_gpio_pin, true);
@@ -78,9 +97,8 @@ void gpio_on_disconnect() {
     }
 
     const auto &config = get_config();
+    ensure_pin_initialized(config.status_gpio_pin);
     if (config.status_gpio_pin == STATUS_GPIO_DISABLED) return;
 
-    gpio_init(config.status_gpio_pin);
     gpio_put(config.status_gpio_pin, false);
-    gpio_set_dir(config.status_gpio_pin, GPIO_OUT);
 }

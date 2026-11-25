@@ -14,9 +14,11 @@
     downloaded.
 
 .PARAMETER Variant
-    standard (default) - normal firmware.
+    standard (default) - normal firmware (Wake-on-PS included).
     debug              - adds -DENABLE_SERIAL=ON -DENABLE_VERBOSE=ON.
-    wake               - adds -DENABLE_WAKE_HID=ON (Wake-on-PS build).
+    wake               - alias for standard (Wake-on-PS is now built into standard).
+    picow              - adds -DPICO_W_BUILD=ON (Raspberry Pi Pico W).
+    waveshare          - adds -DWAVESHARE_RP2350B_PLUS_W_BUILD=ON.
 
 .PARAMETER Clean
     Delete the variant's build directory before configuring.
@@ -45,7 +47,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('standard', 'debug', 'wake')]
+    [ValidateSet('standard', 'debug', 'wake', 'picow', 'waveshare')]
     [string]$Variant = 'standard',
     [switch]$Clean,
     # Project to build when this script is run standalone (not from inside a
@@ -497,8 +499,10 @@ $cmakeArgs = @(
     "-DPython3_EXECUTABLE=$($PythonExe -replace '\\','/')"
 )
 switch ($Variant) {
-    'debug' { $cmakeArgs += @('-DENABLE_SERIAL=ON', '-DENABLE_VERBOSE=ON') }
-    'wake'  { $cmakeArgs += @('-DENABLE_WAKE_HID=ON') }
+    'debug'     { $cmakeArgs += @('-DENABLE_SERIAL=ON', '-DENABLE_VERBOSE=ON') }
+    'wake'      { Info 'Note: Wake-on-PS is built into the standard firmware.' }
+    'picow'     { $cmakeArgs += @('-DPICO_W_BUILD=ON') }
+    'waveshare' { $cmakeArgs += @('-DWAVESHARE_RP2350B_PLUS_W_BUILD=ON') }
 }
 
 Info "Configuring: cmake $($cmakeArgs -join ' ')"

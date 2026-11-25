@@ -5,15 +5,13 @@
 #include <cstdio>
 #include <cstring>
 #include "bt.h"
-#include <queue>
-#include <unordered_map>
-#include <vector>
 #include "audio.h"
 #include "btstack_event.h"
 #include "btstack_tlv.h"
 #include "gap.h"
 #include "hci.h"
 #include "l2cap.h"
+#include "hardware/watchdog.h"
 #include "pico/cyw43_arch.h"
 #include "utils.h"
 #include "bsp/board_api.h"
@@ -37,9 +35,8 @@
 #define MTU_CONTROL 672
 #define MTU_INTERRUPT 672
 
-using std::unordered_map;
-using std::vector;
-using std::queue;
+extern uint8_t reportSeqCounter;
+extern uint8_t packetCounter;
 
 static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 
@@ -74,16 +71,84 @@ static uint16_t hid_control_cid;
 static uint16_t hid_interrupt_cid;
 static bt_data_callback_t bt_data_callback = nullptr;
 static int8_t bt_rssi = 0;
-unordered_map<uint8_t, vector<uint8_t> > feature_data;
+
+struct FeatureCacheSlot {
+    uint8_t report_id = 0;
+    uint8_t len = 0;
+    bool used = false;
+    uint8_t data[128]{};
+};
+
+static FeatureCacheSlot feature_cache[48];
 // Bumped every time a feature report arrives on the HID control channel.
 // Used as a lightweight "response arrived" signal by get_feature_data_live().
 static volatile uint32_t feature_rx_epoch[256];
 queue_t send_fifo;
+static queue_t control_send_fifo;
 
 struct send_element {
     uint8_t data[672];
     size_t len;
 };
+
+struct control_send_element {
+    uint8_t data[68];
+    uint8_t len;
+};
+
+static void feature_cache_clear() {
+    for (auto &slot : feature_cache) {
+        slot.used = false;
+        slot.report_id = 0;
+        slot.len = 0;
+    }
+}
+
+static FeatureCacheSlot *feature_cache_find(uint8_t id) {
+    for (auto &slot : feature_cache) {
+        if (slot.used && slot.report_id == id) {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
+static void feature_cache_store(uint8_t id, const uint8_t *src, uint16_t len) {
+    FeatureCacheSlot *slot = feature_cache_find(id);
+    if (!slot) {
+        for (auto &candidate : feature_cache) {
+            if (!candidate.used) {
+                slot = &candidate;
+                break;
+            }
+        }
+    }
+    if (!slot) {
+        return;
+    }
+    const uint16_t copy_len = len < sizeof(slot->data) ? len : (uint16_t) sizeof(slot->data);
+    slot->report_id = id;
+    slot->len = static_cast<uint8_t>(copy_len);
+    slot->used = true;
+    if (copy_len > 0 && src != nullptr) {
+        memcpy(slot->data, src, copy_len);
+    }
+}
+
+static uint16_t feature_cache_copy(uint8_t id, uint8_t *dst, uint16_t max_len, bool *found) {
+    const FeatureCacheSlot *slot = feature_cache_find(id);
+    if (!slot) {
+        if (found) *found = false;
+        return 0;
+    }
+    if (found) *found = true;
+    if (!dst || max_len == 0) {
+        return 0;
+    }
+    const uint16_t n = slot->len < max_len ? slot->len : max_len;
+    memcpy(dst, slot->data, n);
+    return n;
+}
 
 absolute_time_t inactive_time = 0; // 手柄长时间静默
 
@@ -155,6 +220,7 @@ void bt_l2cap_init() {
 
 int bt_init() {
     queue_init(&send_fifo, sizeof(send_element), 10);
+    queue_init(&control_send_fifo, sizeof(control_send_element), 8);
 
     bt_l2cap_init();
 
@@ -212,7 +278,7 @@ static void bt_blacklist_persist() {
         int rc = tlv->store_tag(tlv_ctx, BT_BLACKLIST_TLV_TAG,
                                 (const uint8_t *) bt_cleared_addrs, bytes);
         printf("[BLACKLIST] Persisted %d entries (%lu bytes) to flash, rc=%d\n",
-               bt_cleared_addrs_count, bytes, rc);
+               bt_cleared_addrs_count, static_cast<unsigned long>(bytes), rc);
     }
 }
 
@@ -297,10 +363,8 @@ void bt_blacklist_persist_if_dirty() {
     bt_blacklist_persist();
 }
 
-// BOOTSEL click action: trigger a fresh inquiry to pair another controller.
-// If currently connected, disconnect (which triggers inquiry restart via the
-// disconnect handler) - link key is preserved so the disconnected controller
-// can still reconnect later.
+// BOOTSEL click action: disconnect the active controller (keeping its link key
+// so it can reconnect later), or start a 30-second pairing inquiry if idle.
 void bt_bootsel_click_action() {
     printf("[BT] BOOTSEL click - fresh inquiry\n");
     if (hid_interrupt_cid != 0) {
@@ -369,6 +433,7 @@ void bt_inquiring_led() {
     static bool led_status = false;
     if (!bt_inquiring) {
         if (led_status) {
+            led_status = false;
             cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
         }
         return;
@@ -537,14 +602,9 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
         case HCI_EVENT_LINK_KEY_REQUEST: {
             bd_addr_t addr;
             hci_event_link_key_request_get_bd_addr(packet, addr);
-            link_key_t link_key;
-            link_key_type_t link_key_type;
+            link_key_t link_key{};
+            link_key_type_t link_key_type = INVALID_LINK_KEY;
             bool link = gap_get_link_key_for_bd_addr(addr, link_key, &link_key_type);
-            printf("[HCI] Link key: ");
-            for (int i = 0; i < sizeof(link_key_t); i++) {
-                printf("%02X", link_key[i]);
-            }
-            printf("\n");
             if (link) {
                 printf("[HCI] Link key request from %s, reply stored key type=%u\n", bd_addr_to_str(addr),
                        (unsigned int) link_key_type);
@@ -588,6 +648,7 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
                 }
                 bt_disconnect();
                 gap_inquiry_start(30);
+                bt_inquiring = true;
             } else {
                 hci_send_cmd(&hci_set_connection_encryption, handle, 1);
             }
@@ -652,6 +713,8 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             bt_rssi = 0;
             hid_control_cid = 0;
             hid_interrupt_cid = 0;
+            reportSeqCounter = 0;
+            packetCounter = 0;
             gpio_on_disconnect();
             wake_on_bt_disconnect();
 #if !ENABLE_SERIAL
@@ -661,12 +724,14 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
 #endif
             while (queue_try_remove(&send_fifo, NULL)) {
             }
+            while (queue_try_remove(&control_send_fifo, NULL)) {
+            }
             cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
 #if ENABLE_BATT_LED
             battery_led_on_disconnect();
 #endif
             printf("[HCI] Disconnected reason=0x%02X\n", reason);
-            bt_data_callback(INTERRUPT, const_cast<uint8_t *>(state_init_data), sizeof(state_init_data));
+            on_bt_disconnect_reset();
             // gap_inquiry_start(30);
             // bt_inquiring = true;
             break;
@@ -693,14 +758,17 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
             bt_data_callback(INTERRUPT, packet, size);
 
             // 静默检测
-            // reads packet[2..12]: skip frames shorter than that
-            if (size < 13 || !(packet[2] & 1) || get_config().inactive_time == 0) {
+            // reads packet[1..12] (and touch flags at packet[35], packet[39] when present)
+            if (size < 13 || packet[1] != 0x31 || !(packet[2] & 1) || get_config().inactive_time == 0) {
                 return;
             }
-            if (packet[3] < 120 || packet[3] > 140 ||
-                packet[4] < 120 || packet[4] > 140 ||
-                packet[5] < 120 || packet[5] > 140 ||
-                packet[6] < 120 || packet[6] > 140 ||
+            const bool touch_active = (size >= 40) &&
+                (!(packet[35] & 0x80) || !(packet[39] & 0x80));
+            if (touch_active ||
+                packet[3] < 118 || packet[3] > 138 ||
+                packet[4] < 118 || packet[4] > 138 ||
+                packet[5] < 118 || packet[5] > 138 ||
+                packet[6] < 118 || packet[6] > 138 ||
                 packet[7] > 0 || packet[8] > 0 ||
                 packet[10] != 0x08 || packet[11] != 0x00 ||
                 packet[12] != 0x00) {
@@ -712,22 +780,22 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
                 bt_disconnect();
             }
         } else if (channel == hid_control_cid) {
-            if (packet[0] == 0xA3) {
+            if (size >= 2 && packet[0] == 0xA3) {
                 const uint8_t report_id = packet[1];
-                feature_data[report_id].assign(packet + 2, packet + size);
-                feature_rx_epoch[report_id]++;
+                feature_cache_store(report_id, packet + 2, size - 2);
+                feature_rx_epoch[report_id] = feature_rx_epoch[report_id] + 1;
 #if ENABLE_VERBOSE
                 printf("[L2CAP] Stored Feature Report 0x%02X, len=%u\n", report_id, size - 2);
                 printf("[L2CAP] HID Control data len=%u\n", size);
                 printf_hexdump(packet, size);
 #endif
                 if (report_id == 0x20) {
-                    if (packet[23] == 0x44) {
+                    if (size > 23 && packet[23] == 0x44) {
                         printf("Connected DSE Controller\n");
                         is_dse = true;
 
                         if (get_config().controller_mode == 0) {
-                            feature_data[0x20].assign(report20,report20 + sizeof(report20));
+                            feature_cache_store(0x20, report20, sizeof(report20));
                         }
                     } else {
                         printf("Connected DS5 Controller\n");
@@ -861,21 +929,65 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
         }
 
         case L2CAP_EVENT_CAN_SEND_NOW: {
-            // printf("[L2CAP] L2CAP_EVENT_CAN_SEND_NOW\n");
-
-            send_element send_packet{};
-            if (queue_try_remove(&send_fifo, &send_packet)) {
-                const uint8_t status = l2cap_send(hid_interrupt_cid, send_packet.data, send_packet.len);
-                if (status != 0) {
-                    printf("[L2CAP] L2CAP Send Error, Status: 0x%02X\n", status);
+            const uint16_t local_cid = l2cap_event_can_send_now_get_local_cid(packet);
+            if (local_cid == hid_control_cid && hid_control_cid != 0) {
+                control_send_element ctrl_packet{};
+                if (queue_try_remove(&control_send_fifo, &ctrl_packet)) {
+                    const uint8_t status = l2cap_send(hid_control_cid, ctrl_packet.data, ctrl_packet.len);
+                    if (status != 0) {
+                        printf("[L2CAP] Control Send Error, Status: 0x%02X\n", status);
+                    }
                 }
-            }
-            if (!queue_is_empty(&send_fifo)) {
-                l2cap_request_can_send_now_event(hid_interrupt_cid);
+                if (!queue_is_empty(&control_send_fifo)) {
+                    l2cap_request_can_send_now_event(hid_control_cid);
+                }
+            } else if (local_cid == hid_interrupt_cid && hid_interrupt_cid != 0) {
+                send_element send_packet{};
+                if (queue_try_remove(&send_fifo, &send_packet)) {
+                    const uint8_t status = l2cap_send(hid_interrupt_cid, send_packet.data, send_packet.len);
+                    if (status != 0) {
+                        printf("[L2CAP] L2CAP Send Error, Status: 0x%02X\n", status);
+                    }
+                }
+                if (!queue_is_empty(&send_fifo)) {
+                    l2cap_request_can_send_now_event(hid_interrupt_cid);
+                }
             }
             break;
         }
     }
+}
+
+static bool enqueue_control_packet(const uint8_t *data, uint8_t len) {
+    if (hid_control_cid == 0 || len == 0 || len > sizeof(control_send_element::data)) {
+        return false;
+    }
+    control_send_element elem{};
+    elem.len = len;
+    memcpy(elem.data, data, len);
+    if (!queue_try_add(&control_send_fifo, &elem)) {
+        return false;
+    }
+    if (queue_get_level(&control_send_fifo) == 1) {
+        l2cap_request_can_send_now_event(hid_control_cid);
+    }
+    return true;
+}
+
+static bool flush_control_send_fifo() {
+    while (!queue_is_empty(&control_send_fifo)) {
+        if (!l2cap_can_send_packet_now(hid_control_cid)) {
+            return false;
+        }
+        control_send_element elem{};
+        if (queue_try_peek(&control_send_fifo, &elem)) {
+            if (l2cap_send(hid_control_cid, elem.data, elem.len) != 0) {
+                return false;
+            }
+            queue_try_remove(&control_send_fifo, NULL);
+        }
+    }
+    return true;
 }
 
 // Push one already-built feature-report frame onto the HID control channel.
@@ -887,7 +999,11 @@ static bool control_send_wait(const uint8_t *data, uint16_t len, uint16_t timeou
 
     const absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
     do {
-        if (l2cap_can_send_packet_now(hid_control_cid) &&
+#if !ENABLE_SERIAL
+        watchdog_update();
+#endif
+        if (flush_control_send_fifo() &&
+            l2cap_can_send_packet_now(hid_control_cid) &&
             l2cap_send(hid_control_cid, const_cast<uint8_t *>(data), len) == 0) {
             return true;
         }
@@ -899,7 +1015,7 @@ static bool control_send_wait(const uint8_t *data, uint16_t len, uint16_t timeou
 }
 
 void __not_in_flash_func(bt_write)(const uint8_t *data, const uint16_t len) {
-    if (hid_interrupt_cid == 0) return;
+    if (hid_interrupt_cid == 0 || len < 4 || static_cast<size_t>(len) + 1 > sizeof(send_element::data)) return;
     static send_element packet{};
     packet.len = len + 1;
     packet.data[0] = 0xA2;
@@ -907,7 +1023,9 @@ void __not_in_flash_func(bt_write)(const uint8_t *data, const uint16_t len) {
     fill_output_report_checksum(packet.data + 1, len);
 
     if (!queue_try_add(&send_fifo, &packet)) {
+#if ENABLE_VERBOSE
         printf("[L2CAP bt_write] Error: Failed to add packet to send FIFO\n");
+#endif
         return;
     }
     if (queue_get_level(&send_fifo) == 1) {
@@ -915,23 +1033,18 @@ void __not_in_flash_func(bt_write)(const uint8_t *data, const uint16_t len) {
     }
 }
 
-vector<uint8_t> get_feature_data(uint8_t reportId, uint16_t len) {
-    (void) len;
-    // Fire-and-forget refresh for reports that change on the controller side;
-    // callers that need a synchronous answer use get_feature_data_live().
-    auto ret = vector<uint8_t>{};
-    const bool has_cached_report = feature_data.contains(reportId);
-    if (has_cached_report) {
-        ret = feature_data[reportId];
-    }
+uint16_t get_feature_data(uint8_t reportId, uint8_t *out_buf, uint16_t max_len) {
+    bool has_cached_report = false;
+    const uint16_t copied = feature_cache_copy(reportId, out_buf, max_len, &has_cached_report);
+
     if (!has_cached_report ||
         // DSE: Set Profile Save?
         reportId == 0x63 ||
         reportId == 0x65 ||
         reportId == 0x64) {
         if (hid_control_cid != 0) {
-            uint8_t get_feature[] = {0x43, reportId};
-            if (!control_send_wait(get_feature, sizeof(get_feature), 100)) {
+            const uint8_t get_feature[] = {0x43, reportId};
+            if (!enqueue_control_packet(get_feature, sizeof(get_feature))) {
                 printf("[L2CAP] Request Get Feature Report 0x%02X failed\n", reportId);
             }
 #if ENABLE_VERBOSE
@@ -939,18 +1052,12 @@ vector<uint8_t> get_feature_data(uint8_t reportId, uint16_t len) {
 #endif
         }
     }
-    return ret;
+    return copied;
 }
 
-vector<uint8_t> get_feature_data_live(uint8_t reportId, uint16_t timeout_ms) {
-    auto cached = vector<uint8_t>{};
-    auto it = feature_data.find(reportId);
-    if (it != feature_data.end()) {
-        cached = it->second;
-    }
-
+uint16_t get_feature_data_live(uint8_t reportId, uint8_t *out_buf, uint16_t max_len, uint16_t timeout_ms) {
     if (hid_control_cid == 0) {
-        return cached;
+        return feature_cache_copy(reportId, out_buf, max_len, nullptr);
     }
 
     // Ask the controller for the report, then drive the BT stack until the
@@ -963,8 +1070,12 @@ vector<uint8_t> get_feature_data_live(uint8_t reportId, uint16_t timeout_ms) {
     uint32_t epoch = 0;
 
     while (!time_reached(deadline)) {
+#if !ENABLE_SERIAL
+        watchdog_update();
+#endif
         if (!sent) {
-            if (l2cap_can_send_packet_now(hid_control_cid) &&
+            if (flush_control_send_fifo() &&
+                l2cap_can_send_packet_now(hid_control_cid) &&
                 l2cap_send(hid_control_cid, get_feature, sizeof(get_feature)) == 0) {
                 sent = true;
                 epoch = feature_rx_epoch[reportId];
@@ -982,17 +1093,17 @@ vector<uint8_t> get_feature_data_live(uint8_t reportId, uint16_t timeout_ms) {
         tight_loop_contents();
     }
 
-    it = feature_data.find(reportId);
-    return it != feature_data.end() ? it->second : cached;
+    return feature_cache_copy(reportId, out_buf, max_len, nullptr);
 }
 
 void set_feature_data(uint8_t reportId, uint8_t *data, uint16_t len) {
     if (hid_control_cid == 0) return;
     // The trailer carries the CRC, so anything shorter than 4 bytes cannot be
     // checksummed (and would underflow the helper).
-    if (len < 4) return;
+    constexpr uint16_t MAX_FEATURE_LEN = 64;
+    if (len < 4 || len > MAX_FEATURE_LEN) return;
 
-    uint8_t get_feature[len + 2];
+    uint8_t get_feature[MAX_FEATURE_LEN + 2];
     get_feature[0] = 0x53;
     get_feature[1] = reportId;
     memcpy(get_feature + 2, data, len);
@@ -1010,19 +1121,20 @@ void set_feature_data(uint8_t reportId, uint8_t *data, uint16_t len) {
 }
 
 void init_feature() {
-    feature_data.clear();
-    get_feature_data(0x09, 20);
-    get_feature_data(0x20, 64);
-    get_feature_data(0x22, 64);
-    get_feature_data(0x05, 41);
+    feature_cache_clear();
+    get_feature_data(0x09, nullptr, 0);
+    get_feature_data(0x20, nullptr, 0);
+    get_feature_data(0x22, nullptr, 0);
+    get_feature_data(0x05, nullptr, 0);
 }
 
 void update_state(const SetStateData &state) {
     uint8_t pkt[142]{};
     pkt[0] = 0x32;
-    pkt[1] = 0x10;
+    pkt[1] = reportSeqCounter << 4;
+    reportSeqCounter = (reportSeqCounter + 1) & 0x0F;
     pkt[2] = 0x90;
-    pkt[3] = 0x3f;
+    pkt[3] = sizeof(SetStateData);
     memcpy(pkt + 4, &state, sizeof(SetStateData));
     bt_write(pkt, sizeof(pkt));
 }

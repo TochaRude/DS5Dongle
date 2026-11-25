@@ -37,41 +37,40 @@ uint8_t packetCounter = 0;
 bool spk_active = false;
 
 USBGetStateData interrupt_in_data{};
+static USBGetStateData remapped_in_data{};
 
 bool report_dirty = false;
+static bool dock_latched = false;
+static uint64_t dock_start_us = 0;
+
+void __not_in_flash_func(refresh_remapped_report)() {
+    remapped_in_data = interrupt_in_data;
+    button_remap_apply(remapped_in_data);
+}
+
+void on_bt_disconnect_reset() {
+    set_headset(false);
+    dock_latched = false;
+    dock_start_us = 0;
+    memcpy(&interrupt_in_data, state_init_data + 3, sizeof(interrupt_in_data));
+    refresh_remapped_report();
+    report_dirty = true;
+}
 
 void __not_in_flash_func(interrupt_loop)() {
     if (usb_keyboard_only || usb_reconfiguring || !tud_hid_ready()) return;
 
-    // TODO: Refactor for better code reuse
-    if (get_config().polling_rate_mode != 3) {
-        USBGetStateData report = interrupt_in_data;
-        button_remap_apply(report);
-        if (!tud_hid_report(0x01, &report, sizeof(report))) {
-            printf("[USBHID] tud_hid_report error\n");
-        }
+    const bool realtime = (get_config().polling_rate_mode == 3);
+    if (realtime && !report_dirty) {
         return;
     }
 
-    bool should_send = false;
-    USBGetStateData report{};
-
-    if (report_dirty) {
-        report = interrupt_in_data;
+    if (tud_hid_report(0x01, &remapped_in_data, sizeof(remapped_in_data))) {
         report_dirty = false;
-        should_send = true;
-    }
-
-    // Only send to TinyUSB if we actually grabbed fresh data
-    if (should_send) {
-        button_remap_apply(report);
-        if (!tud_hid_report(0x01, &report, sizeof(report))) {
-            printf("[USBHID] tud_hid_report error\n");
-
-            // If the report failed to queue, restore the dirty flag 
-            // so we try again on the next loop iteration.
-            report_dirty = true;
-        }
+    } else {
+#if ENABLE_VERBOSE
+        printf("[USBHID] tud_hid_report error\n");
+#endif
     }
 }
 
@@ -118,8 +117,6 @@ void __not_in_flash_func(on_bt_data)(CHANNEL_TYPE channel, uint8_t *data, uint16
         // sustained dock contact for 2 seconds before triggering sleep / disconnect.
         // This prevents accidental triggers if the controller is momentarily placed
         // or adjusted in the cradle.
-        static bool dock_latched = false;
-        static uint64_t dock_start_us = 0;
         const bool docked = (data[56] >> 6) & 1;
         const uint64_t now_us = time_us_64();
         if (!docked) {
@@ -148,6 +145,7 @@ void __not_in_flash_func(on_bt_data)(CHANNEL_TYPE channel, uint8_t *data, uint16
         // modes silently breaks wake while the host is suspended.
         wake_on_bt_input(data + 3, len - 3);
         memcpy(&interrupt_in_data, data + 3, sizeof(interrupt_in_data));
+        refresh_remapped_report();
         if (!usb_keyboard_only && !usb_reconfiguring) {
             button_shortcut_tick(interrupt_in_data);
         }
@@ -197,18 +195,10 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
     // pumps the BT stack (not tud_task()) until the 0xA3 reply arrives or the
     // timeout expires, then falls back to the last cached body.
     if (report_id == 0x81 || (report_id >= 0x70 && report_id <= 0x7B)) {
-        std::vector<uint8_t> live = get_feature_data_live(report_id, 250);
-        if (live.empty()) return 0;
-        const uint16_t n = live.size() < reqlen ? (uint16_t) live.size() : reqlen;
-        memcpy(buffer, live.data(), n);
-        return n;
+        return get_feature_data_live(report_id, buffer, reqlen, 250);
     }
 
-    std::vector<uint8_t> feature_data = get_feature_data(report_id, reqlen);
-    if (feature_data.empty()) return 0;
-    const uint16_t n = feature_data.size() < reqlen ? (uint16_t) feature_data.size() : reqlen;
-    memcpy(buffer, feature_data.data(), n);
-    return n;
+    return get_feature_data(report_id, buffer, reqlen);
 }
 
 bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_request) {
@@ -217,11 +207,15 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
     uint8_t const alt = tu_u16_low(p_request->wValue); // bAlternateSetting
 
     if (itf == 1) {
+#if ENABLE_VERBOSE
         printf("[AUDIO] Set interface Speaker to alternate setting %d\n", alt);
+#endif
         spk_active = alt;
     }
     if (itf == 2) { // ITF_NUM_AUDIO_STREAMING_IN (microphone)
+#if ENABLE_VERBOSE
         printf("[AUDIO] Set interface Microphone to alternate setting %d\n", alt);
+#endif
         set_mic_active(alt);
     }
 
@@ -298,16 +292,20 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
     (void) bufsize;
 
     if (is_pico_cmd(report_id)) {
+        if (bufsize == 0) {
+            return;
+        }
         // TinyUSB owns this buffer. USB printf() may re-enter tud_task() and reuse it,
         // so copy the entire command before printing or processing it.
         uint8_t buf_copy[CFG_TUD_HID_EP_BUFSIZE];
-        memcpy(buf_copy, buffer, bufsize);
+        const uint16_t n = bufsize < sizeof(buf_copy) ? bufsize : (uint16_t) sizeof(buf_copy);
+        memcpy(buf_copy, buffer, n);
 
 #if ENABLE_VERBOSE
         printf("[HID] Receive 0x%02X setting config, funcid:0x%02X\n", report_id, buf_copy[0]);
 #endif
 
-        pico_cmd_set(report_id, buf_copy, bufsize);
+        pico_cmd_set(report_id, buf_copy, n);
         return;
     }
 
@@ -339,13 +337,14 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
 int main() {
 #if SYS_CLOCK_KHZ != 150000
     vreg_set_voltage(VREG_VOLTAGE_1_20);
-    sleep_ms(1000);
+    sleep_ms(10);
     set_sys_clock_khz(SYS_CLOCK_KHZ, true);
 #else
     vreg_set_voltage(VREG_VOLTAGE_DEFAULT); // the VREG keeps 1.20 V from older firmware until a power cycle
 #endif
 
     board_init();
+    memcpy(&interrupt_in_data, state_init_data + 3, sizeof(interrupt_in_data));
     config_load();
 #if !ENABLE_SERIAL
     usb_keyboard_only = get_config().enable_wake;

@@ -11,6 +11,7 @@ constexpr uint8_t BUTTON_REMAP_COUNT = 28;
 
 struct USBGetStateData;
 void button_remap_apply(USBGetStateData& state_data);
+void refresh_remapped_report();
 
 
 #endif //DS5_BRIDGE_BUTTON_MAP_H

@@ -5,9 +5,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <iomanip>
-#include <iostream>
 
 #include "hci_cmd.h"
 #include "pico/platform/sections.h"
@@ -129,6 +128,7 @@ inline uint32_t crc32(const uint8_t* data, size_t size) {
 
 inline void fill_output_report_checksum(uint8_t* outputData,size_t len)
 {
+    if (len < 4) return;
     uint32_t crc = crc32(outputData, len - 4);
     outputData[len - 4] = (crc >> 0) & 0xFF;
     outputData[len - 3] = (crc >> 8) & 0xFF;
@@ -142,6 +142,7 @@ inline uint32_t crc32_feature(const uint8_t *data, std::size_t size) {
 }
 
 inline void fill_feature_report_checksum(uint8_t *data, const size_t len) {
+    if (len < 4) return;
     uint32_t crc = crc32_feature(data,len - 4);
     data[len - 4] = (crc >> 0) & 0xFF;
     data[len - 3] = (crc >> 8) & 0xFF;
@@ -290,7 +291,7 @@ namespace LightFadeAnimation {
     };
 }
 
-struct __attribute__((packed)) SetStateData { // 47
+struct __attribute__((packed)) SetStateData { // 63
 /*    */ // Report Set Flags
 /*    */ // These flags are used to indicate what contents from this report should be processed
 /* 0.0*/ uint8_t EnableRumbleEmulation: 1; // Suggest halving rumble strength
@@ -415,9 +416,5 @@ struct __attribute__((packed)) SetStateData { // 47
 // Structure ends here though on BT there is padding and a CRC, see ReportOut31
 };
 
-inline void print_hex(const uint8_t* data,size_t size) {
-    for (int i = 0; i < size; i++) {
-        std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[i]) << " ";
-    }
-    std::cout << std::endl;
-}
+static_assert(sizeof(USBGetStateData) == 63);
+static_assert(sizeof(SetStateData) == 63);

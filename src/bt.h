@@ -6,7 +6,6 @@
 #define DS5_BRIDGE_BT_H
 
 #include <cstdint>
-#include <vector>
 
 enum CHANNEL_TYPE {
     INTERRUPT,
@@ -29,14 +28,15 @@ void bt_set_scan_idle();
 void bt_set_scan_active();
 void bt_write(const uint8_t *data, uint16_t len);
 void bt_get_signal_strength(int8_t *rssi);
-std::vector<uint8_t> get_feature_data(uint8_t reportId, uint16_t len);
+uint16_t get_feature_data(uint8_t reportId, uint8_t *out_buf, uint16_t max_len);
 
 // Issue a GET_REPORT (0x43 <id>) over the HID control channel and pump the BT
 // stack until the matching 0xA3 response arrives, or until timeout_ms expires.
-// Returns the cached/just-received report body (without the report id byte).
+// Copies the cached/just-received report body (without the report id byte)
+// into out_buf and returns the copied byte count.
 // Must be called from the main context (e.g. the USB GET_REPORT callback): it
 // drives cyw43_arch_poll() itself and never calls tud_task().
-std::vector<uint8_t> get_feature_data_live(uint8_t reportId, uint16_t timeout_ms);
+uint16_t get_feature_data_live(uint8_t reportId, uint8_t *out_buf, uint16_t max_len, uint16_t timeout_ms);
 
 void init_feature();
 void set_feature_data(uint8_t reportId, uint8_t* data,uint16_t len);
@@ -46,5 +46,6 @@ void bt_bootsel_click_action();
 void bt_bootsel_hold_action();
 void bt_blacklist_persist_if_dirty();
 void update_state(const SetStateData& state);
+void on_bt_disconnect_reset();
 
 #endif //DS5_BRIDGE_BT_H

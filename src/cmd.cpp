@@ -12,6 +12,7 @@
 #include "button_shortcut.h"
 #include "config.h"
 #include "device/usbd.h"
+#include "pico/bootrom.h"
 #include "pico/time.h"
 #include "audio.h"
 #include "usb.h"
@@ -104,30 +105,39 @@ void pico_cmd_set(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
         return;
     }
 
-    // 0x01 update config in variable
-    // 0x02 write config to flash
-    // 0x03 reconnect tinyusb device;
-    if (buffer[0] == 0x01) {
+    if (report_id != 0xf6) {
+        return;
+    }
+
+    switch (buffer[0]) {
+        case PICO_CMD_UPDATE_CONFIG:
 #if ENABLE_VERBOSE
-        printf("[CMD] Enter config set func\n");
+            printf("[CMD] Enter config set func\n");
 #endif
-        set_config(buffer + 1, bufsize - 1);
-    }
-    if (buffer[0] == PICO_CMD_SAVE_TO_FLASH) {
-        printf("[CMD] Enter config save func\n");
-        config_save();
-    }
-    if (buffer[0] == PICO_CMD_RECONNECT_USB) {
-        printf("[CMD] Enter tud reconnect func\n");
-        usb_reconnect(usb_keyboard_only);
-    }
-    if (buffer[0] == PICO_CMD_SHORTCUT_LEARNING) {
-        // The config UI starts listening for a controller trigger; pause the
-        // shortcut state machine so the captured press does not also fire.
-        // Only starting is supported: a window always ends on its deadline.
-        if (bufsize >= 2 && buffer[1]) {
-            printf("[CMD] Shortcut learning window\n");
-            button_shortcut_start_learning();
-        }
+            set_config(buffer + 1, bufsize - 1);
+            break;
+        case PICO_CMD_SAVE_TO_FLASH:
+            printf("[CMD] Enter config save func\n");
+            config_save();
+            break;
+        case PICO_CMD_RECONNECT_USB:
+            printf("[CMD] Enter tud reconnect func\n");
+            usb_reconnect(usb_keyboard_only);
+            break;
+        case PICO_CMD_REBOOT_BOOTSEL:
+            printf("[CMD] Rebooting into BOOTSEL\n");
+            reset_usb_boot(0, 0);
+            break;
+        case PICO_CMD_SHORTCUT_LEARNING:
+            // The config UI starts listening for a controller trigger; pause the
+            // shortcut state machine so the captured press does not also fire.
+            // Only starting is supported: a window always ends on its deadline.
+            if (bufsize >= 2 && buffer[1]) {
+                printf("[CMD] Shortcut learning window\n");
+                button_shortcut_start_learning();
+            }
+            break;
+        default:
+            break;
     }
 }

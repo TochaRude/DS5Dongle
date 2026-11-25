@@ -6,8 +6,8 @@ PICO_SDK_VERSION="2.3.1"
 # submodule, so this is a commit rather than a tag (fetched explicitly below).
 TINYUSB_VERSION="98741b55959564746998d0453c32d87064629d7c"
 BUILD_TYPE="Release"
-BUILD_DIR="build/wake"
-ENABLE_WAKE_HID="ON"
+BUILD_DIR="build/standard"
+EXTRA_CMAKE_ARGS=()
 SDK_DIR=""
 DEFAULT_SDK_DIR=""
 USING_DEFAULT_SDK="ON"
@@ -21,8 +21,10 @@ Usage: tools/build-macos.sh [options]
 Build DS5Dongle on macOS using a repo-local Pico SDK checkout.
 
 Options:
-  --standard          Build standard firmware without ENABLE_WAKE_HID.
-  --wake              Build wake firmware with ENABLE_WAKE_HID (default).
+  --standard          Build standard firmware (default; Wake-on-PS is included).
+  --wake              Alias for --standard (kept for backwards compatibility).
+  --picow             Build for Raspberry Pi Pico W (-DPICO_W_BUILD=ON).
+  --waveshare         Build for Waveshare RP2350B-Plus-W (-DWAVESHARE_RP2350B_PLUS_W_BUILD=ON).
   --clean             Remove the selected build directory before configuring.
   --sdk-dir <path>    Use this Pico SDK checkout instead of .deps/pico-sdk.
   -h, --help          Show this help.
@@ -78,13 +80,24 @@ find_arm_cask_toolchain() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --standard)
-      ENABLE_WAKE_HID="OFF"
+      EXTRA_CMAKE_ARGS=()
       BUILD_DIR="build/standard"
       shift
       ;;
     --wake)
-      ENABLE_WAKE_HID="ON"
-      BUILD_DIR="build/wake"
+      echo "Note: Wake-on-PS is built into the standard firmware."
+      EXTRA_CMAKE_ARGS=()
+      BUILD_DIR="build/standard"
+      shift
+      ;;
+    --picow)
+      EXTRA_CMAKE_ARGS=(-DPICO_W_BUILD=ON)
+      BUILD_DIR="build/picow"
+      shift
+      ;;
+    --waveshare)
+      EXTRA_CMAKE_ARGS=(-DWAVESHARE_RP2350B_PLUS_W_BUILD=ON)
+      BUILD_DIR="build/waveshare"
       shift
       ;;
     --clean)
@@ -127,7 +140,7 @@ fi
 echo "Repository: $ROOT"
 echo "Pico SDK:   $SDK_DIR"
 echo "Build dir:  $BUILD_DIR"
-echo "Wake HID:   $ENABLE_WAKE_HID"
+echo "Extra args: ${EXTRA_CMAKE_ARGS[*]:-(none)}"
 echo
 
 if ! xcode-select -p >/dev/null 2>&1; then
@@ -226,7 +239,7 @@ CMAKE_ARGS=(
   -G Ninja
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
   -DPICO_SDK_PATH="$SDK_DIR"
-  -DENABLE_WAKE_HID="$ENABLE_WAKE_HID"
+  "${EXTRA_CMAKE_ARGS[@]}"
 )
 
 if [[ -n "$PICO_TOOLCHAIN_PATH" ]]; then

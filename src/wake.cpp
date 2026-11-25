@@ -12,7 +12,6 @@
 #include "bt.h"
 #include "tusb.h"
 #include "device/dcd.h"
-#include "pico/sync.h"
 #include "pico/time.h"
 #include "button_shortcut.h"
 #include "config.h"
@@ -66,13 +65,12 @@ typedef enum {
     WAKE_DONE,
 } wake_state_t;
 
-static critical_section_t wake_cs;
-static volatile bool host_suspended = false;
-static volatile bool host_resumed_event = false;
-static volatile uint64_t resume_at_us = 0;
-static volatile bool pending_usb_reconnect = false;
-static volatile uint64_t reconnect_started_us = 0;
-static volatile uint8_t reconnect_retries = 0;
+static bool host_suspended = false;
+static bool host_resumed_event = false;
+static uint64_t resume_at_us = 0;
+static bool pending_usb_reconnect = false;
+static uint64_t reconnect_started_us = 0;
+static uint8_t reconnect_retries = 0;
 static wake_state_t state = WAKE_IDLE;
 static uint64_t state_entered_us = 0;
 static uint8_t key_attempts = 0;
@@ -82,9 +80,9 @@ static uint8_t prev_b7 = 0x08;
 static uint8_t prev_b8 = 0x00;
 static uint8_t prev_b9 = 0x00;
 // Debounced controller disconnect: time of the pending suspend (0 = none pending).
-static volatile uint64_t suspend_at_us = 0;
+static uint64_t suspend_at_us = 0;
 // During a deliberate USB reconnect, ignore the suspend it triggers until this time.
-static volatile uint64_t reconnect_until_us = 0;
+static uint64_t reconnect_until_us = 0;
 
 static void enter_state(wake_state_t s) {
     state = s;
@@ -104,10 +102,7 @@ static void request_host_wake(const char *reason) {
     }
 
     if (ok) {
-        critical_section_enter_blocking(&wake_cs);
-        state = WAKE_REQUESTED;
-        state_entered_us = time_us_64();
-        critical_section_exit(&wake_cs);
+        enter_state(WAKE_REQUESTED);
         WAKE_DBG("%s -> REQUESTED", reason);
     }
 #ifdef WAKE_DEBUG
@@ -123,7 +118,6 @@ static void request_host_wake(const char *reason) {
 }
 
 void wake_init(void) {
-    critical_section_init(&wake_cs);
 }
 
 // Called right before a deliberate USB reconnect (FUNC_RECONNECT): arm a grace window so the
@@ -143,13 +137,11 @@ void wake_note_usb_reconnect(void) {
 bool wake_defer_usb_reconnect(void) {
     if (!get_config().enable_wake) return false;
     const uint64_t now = time_us_64();
-    critical_section_enter_blocking(&wake_cs);
     const bool busy = state == WAKE_REQUESTED || state == WAKE_KEY_DOWN ||
                       state == WAKE_KEY_UP_SENT;
     const bool settling = (resume_at_us != 0) && (now - resume_at_us < WAKE_RECONNECT_SETTLE_US);
     const bool defer = host_suspended || tud_suspended() || busy || settling;
     pending_usb_reconnect = defer;
-    critical_section_exit(&wake_cs);
     if (defer) {
         WAKE_DBG("deferring usb_reconnect(false) until wake/resume completes");
     }
@@ -191,10 +183,8 @@ extern "C" void tud_suspend_cb(bool remote_wakeup_en) {
 
 void wake_on_bt_connect(void) {
     if (!get_config().enable_wake) return;
-    critical_section_enter_blocking(&wake_cs);
     const bool should_wake = (host_suspended || tud_suspended()) &&
         (state == WAKE_IDLE || state == WAKE_DONE || state == WAKE_PENDING_PRESS);
-    critical_section_exit(&wake_cs);
 
     if (should_wake) {
         request_host_wake("BT reconnect while suspended");
@@ -280,11 +270,9 @@ void wake_on_bt_input(const uint8_t *hid_input, uint16_t len) {
     const uint8_t b8 = hid_input[8];
     const uint8_t b9 = hid_input[9];
 
-    critical_section_enter_blocking(&wake_cs);
     const bool changed = (b7 != prev_b7) || (b8 != prev_b8) || (b9 != prev_b9);
     const bool armable = (state == WAKE_IDLE || state == WAKE_DONE || state == WAKE_PENDING_PRESS);
     prev_b7 = b7; prev_b8 = b8; prev_b9 = b9;
-    critical_section_exit(&wake_cs);
 
     if (changed && armable) {
         request_host_wake("button event");
@@ -292,22 +280,17 @@ void wake_on_bt_input(const uint8_t *hid_input, uint16_t len) {
 }
 
 void wake_on_bt_disconnect(void) {
-    critical_section_enter_blocking(&wake_cs);
     state = WAKE_IDLE;
     pending_usb_reconnect = false;
     reconnect_retries = 0;
     prev_b7 = 0x08; prev_b8 = 0x00; prev_b9 = 0x00;
-    critical_section_exit(&wake_cs);
     button_shortcut_reset();
 }
 
 bool wake_keyboard_busy() {
     if (!get_config().enable_wake) return false;
-    critical_section_enter_blocking(&wake_cs);
-    const bool busy = state == WAKE_REQUESTED || state == WAKE_KEY_DOWN ||
-                      state == WAKE_KEY_UP_SENT;
-    critical_section_exit(&wake_cs);
-    return busy;
+    return state == WAKE_REQUESTED || state == WAKE_KEY_DOWN ||
+           state == WAKE_KEY_UP_SENT;
 }
 
 void wake_task(void) {
@@ -326,10 +309,8 @@ void wake_task(void) {
 
     if (!get_config().enable_wake) return;
 
-    critical_section_enter_blocking(&wake_cs);
     const wake_state_t s = state;
     const uint64_t entered = state_entered_us;
-    critical_section_exit(&wake_cs);
 
     switch (s) {
             case WAKE_IDLE:
@@ -357,10 +338,8 @@ void wake_task(void) {
 #endif
                         if (now - settle_origin > WAKE_KEY_TIMEOUT_US) {
                             WAKE_DBG("REQUESTED: hid_n_ready timeout -> DONE");
-                            critical_section_enter_blocking(&wake_cs);
                             enter_state(WAKE_DONE);
                             key_attempts = 0;
-                            critical_section_exit(&wake_cs);
                             break;
                         }
                         return;
@@ -369,19 +348,15 @@ void wake_task(void) {
                     const bool sent = tud_hid_n_report(WAKE_KBD_INSTANCE, 0, rpt, sizeof(rpt));
                     WAKE_DBG("REQUESTED: sent keydown 0x%02X -> %d", WAKE_KEYCODE_F15, (int)sent);
                     if (sent) {
-                        critical_section_enter_blocking(&wake_cs);
                         enter_state(WAKE_KEY_DOWN);
-                        critical_section_exit(&wake_cs);
                     }
                 } else if (now - entered > WAKE_REQUEST_TIMEOUT_US) {
                     WAKE_DBG("REQUESTED timeout 5s -> DONE (no resume signaling; may have already woken)");
-                    critical_section_enter_blocking(&wake_cs);
                     if (!tud_suspended()) {
                         host_suspended = false;
                     }
                     enter_state(WAKE_DONE);
                     key_attempts = 0;
-                    critical_section_exit(&wake_cs);
                     break;
                 }
                 return;
@@ -399,10 +374,8 @@ void wake_task(void) {
 #endif
                     if (now - entered > WAKE_KEY_TIMEOUT_US) {
                         WAKE_DBG("KEY_DOWN: hid_n_ready timeout -> DONE");
-                        critical_section_enter_blocking(&wake_cs);
                         enter_state(WAKE_DONE);
                         key_attempts = 0;
-                        critical_section_exit(&wake_cs);
                         break;
                     }
                     return;
@@ -411,9 +384,7 @@ void wake_task(void) {
                 const bool sent = tud_hid_n_report(WAKE_KBD_INSTANCE, 0, up, sizeof(up));
                 WAKE_DBG("KEY_DOWN: sent keyup -> %d", (int)sent);
                 if (sent) {
-                    critical_section_enter_blocking(&wake_cs);
                     enter_state(WAKE_KEY_UP_SENT);
-                    critical_section_exit(&wake_cs);
                 }
                 return;
             }
@@ -436,10 +407,8 @@ void wake_task(void) {
 #endif
                         if (now - entered > WAKE_KEY_TIMEOUT_US) {
                             WAKE_DBG("KEY_UP_SENT: hid_n_ready timeout -> DONE");
-                            critical_section_enter_blocking(&wake_cs);
                             enter_state(WAKE_DONE);
                             key_attempts = 0;
-                            critical_section_exit(&wake_cs);
                             break;
                         }
                         return;
@@ -450,17 +419,13 @@ void wake_task(void) {
                     WAKE_DBG("KEY_UP_SENT: retrying F15 (attempt %d/%d) -> %d",
                              (int)key_attempts + 1, (int)WAKE_KEY_ATTEMPTS, (int)sent);
                     if (sent) {
-                        critical_section_enter_blocking(&wake_cs);
                         enter_state(WAKE_KEY_DOWN);
-                        critical_section_exit(&wake_cs);
                     }
                     return;
                 } else {
                     WAKE_DBG("KEY_UP_SENT settle done -> DONE");
-                    critical_section_enter_blocking(&wake_cs);
                     enter_state(WAKE_DONE);
                     key_attempts = 0;
-                    critical_section_exit(&wake_cs);
                     break;
                 }
             }

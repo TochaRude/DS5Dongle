@@ -5,15 +5,19 @@
 #include "config.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
+#include "audio.h"
 #include "bt.h"
+#include "button_remap.h"
 #include "button_shortcut.h"
 #include "button_utils.h"
 #include "status_gpio.h"
 #include "utils.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "hardware/watchdog.h"
 #include "pico/btstack_flash_bank.h"
 #include "pico/cyw43_arch.h"
 #include "pico/flash.h"
@@ -40,33 +44,69 @@ static const ConfigStorage *get_xip_addr(uint32_t offset) {
     return reinterpret_cast<const ConfigStorage *>(XIP_BASE + offset);
 }
 
-static bool load_old_config() {
+static bool load_old_config(ConfigStorage &s) {
     const auto old_addr = get_xip_addr(PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE);
     uint32_t magic_header;
     memcpy(&magic_header, old_addr, sizeof(uint32_t));
     if (magic_header == CONFIG_MAGIC) {
         printf("[Config] Trying load old sector config\n");
-        memset(&storage, 0xFF, sizeof(storage)); // 先进行 0xFF 填充，确保后续缺项能够正常初始化
-        memcpy(&storage, old_addr, sizeof(storage));
+        memset(&s, 0xFF, sizeof(s)); // 先进行 0xFF 填充，确保后续缺项能够正常初始化
+        memcpy(&s, old_addr, sizeof(s));
         printf("[Config] Old Config loaded\n");
         return true;
     }
     return false;
 }
 
-void config_valid() {
+static void validate_button_remap(ConfigStorage &s) {
+    for (uint8_t i = 0; i < BUTTON_REMAP_COUNT; i++) {
+        if (s.button.button_remap[i] > Disable) {
+            printf("[Config] Button remap value is invalid %u\n", s.button.button_remap[i]);
+            s.button.button_remap[i] = i;
+        }
+    }
+}
+
+static void validate_shortcuts(ConfigStorage &s) {
+    for (auto &shortcut : s.button.shortcuts) {
+        if (!shortcut_slot_valid(shortcut)) {
+            // Slot enablement is represented only by trigger_a; normalize every
+            // invalid or disabled slot to one deterministic byte representation.
+            shortcut.trigger_a = BUTTON_SHORTCUT_DISABLED;
+            shortcut.trigger_b = BUTTON_SHORTCUT_DISABLED;
+            shortcut.action = ShortcutActionKeyboard;
+            shortcut.flags = 0;
+            memset(shortcut.payload, 0, sizeof(shortcut.payload));
+            continue;
+        }
+        switch (shortcut.action) {
+            case ShortcutActionKeyboard:
+                shortcut.keyboard.reserved = 0;
+                break;
+            case ShortcutActionConsumer:
+                shortcut.consumer.reserved = 0;
+                break;
+            default:
+                // Firmware actions do not consume the payload bytes.
+                memset(shortcut.payload, 0, sizeof(shortcut.payload));
+                break;
+        }
+    }
+}
+
+static void validate_storage(ConfigStorage &s) {
     // valid config and set default value
-    if (config.magic != CONFIG_MAGIC) {
-        if (!load_old_config()) {
-            config.magic = CONFIG_MAGIC;
+    if (s.config.magic != CONFIG_MAGIC) {
+        if (&s != &storage || !load_old_config(s)) {
+            s.config.magic = CONFIG_MAGIC;
             printf("[Config] Config Magic Header is invalid\n");
         }
     }
-    if (config.size != sizeof(Config_body)) {
-        config.size = sizeof(Config_body);
+    if (s.config.size != sizeof(Config_body)) {
+        s.config.size = sizeof(Config_body);
         printf("[Config] Config Body size is invalid\n");
     }
-    auto body = &config.body;
+    auto *body = &s.config.body;
     if (body->config_version != CONFIG_VERSION) {
         memset(body, 0xFF, sizeof(Config_body));
         body->config_version = CONFIG_VERSION;
@@ -156,50 +196,45 @@ void config_valid() {
         body->sleep_on_dock = 0;
         printf("[Config] sleep_on_dock is invalid\n");
     }
-    button_remap_valid();
-    shortcut_valid();
+    validate_button_remap(s);
+    validate_shortcuts(s);
+}
+
+void config_valid() {
+    validate_storage(storage);
 }
 
 void button_remap_valid() {
-    for (uint8_t i = 0; i < BUTTON_REMAP_COUNT; i++) {
-        if (storage.button.button_remap[i] > Disable) {
-            printf("[Config] Button remap value is invalid %u\n", storage.button.button_remap[i]);
-            storage.button.button_remap[i] = i;
-        }
-    }
+    validate_button_remap(storage);
 }
 
 void shortcut_valid() {
-    for (auto &shortcut : storage.button.shortcuts) {
-        if (!shortcut_slot_valid(shortcut)) {
-            // Slot enablement is represented only by trigger_a; normalize every
-            // invalid or disabled slot to one deterministic byte representation.
-            shortcut.trigger_a = BUTTON_SHORTCUT_DISABLED;
-            shortcut.trigger_b = BUTTON_SHORTCUT_DISABLED;
-            shortcut.action = ShortcutActionKeyboard;
-            shortcut.flags = 0;
-            memset(shortcut.payload, 0, sizeof(shortcut.payload));
-            continue;
-        }
-        switch (shortcut.action) {
-            case ShortcutActionKeyboard:
-                shortcut.keyboard.reserved = 0;
-                break;
-            case ShortcutActionConsumer:
-                shortcut.consumer.reserved = 0;
-                break;
-            default:
-                // Firmware actions do not consume the payload bytes.
-                memset(shortcut.payload, 0, sizeof(shortcut.payload));
-                break;
-        }
-    }
+    validate_shortcuts(storage);
 }
 
 void config_load() {
     memcpy(&storage, get_xip_addr(CONFIG_FLASH_OFFSET), sizeof(storage));
 
+    if (storage.config.magic != CONFIG_MAGIC) {
+        if (!load_old_config(storage)) {
+            memset(&storage, 0xFF, sizeof(storage));
+            storage.config.magic = CONFIG_MAGIC;
+            printf("[Config] Config Magic Header is invalid\n");
+        }
+    }
+
+    if (storage.config.magic == CONFIG_MAGIC &&
+        storage.config.size == sizeof(Config_body) &&
+        storage.config.body.config_version == CONFIG_VERSION) {
+        if (calc_config_crc(storage) != storage.config.crc32) {
+            printf("[Config] Warning: Flash CRC32 mismatch, resetting to defaults\n");
+            memset(&storage, 0xFF, sizeof(storage));
+            storage.config.magic = CONFIG_MAGIC;
+        }
+    }
+
     config_valid();
+    refresh_remapped_report();
 }
 
 // Runs with core1 parked (flash_safe_execute) and core0 interrupts disabled, so
@@ -219,7 +254,13 @@ bool config_save() {
     memset(page, 0xff, sizeof(page));
     memcpy(page, &storage, sizeof(storage));
 
-    const int rc = flash_safe_execute(config_save_flash_op, page, 1000);
+#if !ENABLE_SERIAL
+    watchdog_update();
+#endif
+    const int rc = flash_safe_execute(config_save_flash_op, page, 500);
+#if !ENABLE_SERIAL
+    watchdog_update();
+#endif
     if (rc != PICO_OK) {
         printf("[Config] config_save flash_safe_execute failed: %d\n", rc);
         return false;
@@ -248,6 +289,7 @@ void set_button_remap(const uint8_t *new_remap, const uint16_t len) {
     const auto copy_len = len < BUTTON_REMAP_COUNT ? len : BUTTON_REMAP_COUNT;
     memcpy(storage.button.button_remap, new_remap, copy_len);
     button_remap_valid();
+    refresh_remapped_report();
 }
 
 void set_shortcut(const uint8_t *new_shortcuts, const uint16_t len) {
@@ -258,18 +300,35 @@ void set_shortcut(const uint8_t *new_shortcuts, const uint16_t len) {
     shortcut_valid();
 }
 
+static void apply_validated_config(ConfigStorage &next) {
+    validate_storage(next);
+    const uint8_t validated_mic = next.config.body.mic_select;
+    const uint8_t validated_spk = next.config.body.speaker_select;
+    next.config.body.mic_select = config.body.mic_select;
+    next.config.body.speaker_select = config.body.speaker_select;
+    config.body = next.config.body;
+    __atomic_store_n(&config.body.mic_select, validated_mic, __ATOMIC_RELAXED);
+    __atomic_store_n(&config.body.speaker_select, validated_spk, __ATOMIC_RELAXED);
+    storage.button = next.button;
+    refresh_remapped_report();
+}
+
 void set_config(const uint8_t *new_config, const uint16_t len) {
     const bool controller_connected = bt_is_connected();
     gpio_on_disconnect();
 
     const uint8_t prev_sleep_on_dock = config.body.sleep_on_dock;
+    const uint8_t prev_mic_select = config.body.mic_select;
+    ConfigStorage next = storage;
     const auto copy_len = len < sizeof(Config_body) ? len : sizeof(Config_body);
-    memcpy(&config.body, new_config, copy_len);
+    memcpy(&next.config.body, new_config, copy_len);
     // If set from legacy tool/web UI (which only sends 24 bytes), preserve sleep_on_dock
     if (len <= 24) {
-        config.body.sleep_on_dock = prev_sleep_on_dock;
+        next.config.body.sleep_on_dock = prev_sleep_on_dock;
     }
-    config_valid();
+    apply_validated_config(next);
+
+    const bool mic_changed = (prev_mic_select != config.body.mic_select);
 
     if (controller_connected && config.body.status_gpio_mode != STATUS_GPIO_MODE_BUTTON) {
         gpio_on_connect();
@@ -279,30 +338,37 @@ void set_config(const uint8_t *new_config, const uint16_t len) {
 
     if (config.body.disable_pico_led) {
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
-    }else {
+    } else if (controller_connected) {
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, true);
     }
-    SetStateData state{};
-    if (config.body.trigger_reduce > 0) {
-        state.AllowMotorPowerLevel = 1;
-        state.TriggerMotorPowerReduction = config.body.trigger_reduce;
+
+    if (controller_connected) {
+        SetStateData state{};
+        if (config.body.trigger_reduce > 0) {
+            state.AllowMotorPowerLevel = 1;
+            state.TriggerMotorPowerReduction = config.body.trigger_reduce;
+        }
+        if (config.body.speaker_gain > 0) {
+            state.AllowAudioControl2 = 1;
+            state.SpeakerCompPreGain = config.body.speaker_gain;
+        }
+        state.AllowAudioControl = 1;
+        state.MicSelect = config.body.mic_select;
+        state.NoiseCancelEnable = 1;
+        update_state(state);
+        if (mic_changed) {
+            update_mic_status();
+        }
     }
-    if (config.body.speaker_gain > 0) {
-        state.AllowAudioControl2 = 1;
-        state.SpeakerCompPreGain = config.body.speaker_gain;
-    }
-    state.AllowAudioControl = 1;
-    state.MicSelect = config.body.mic_select;
-    state.NoiseCancelEnable = 1;
-    update_state(state);
 }
 
 void set_config(const Config_body &new_config) {
     const bool controller_connected = bt_is_connected();
     gpio_on_disconnect();
 
-    config.body = new_config;
-    config_valid();
+    ConfigStorage next = storage;
+    next.config.body = new_config;
+    apply_validated_config(next);
 
     if (controller_connected && config.body.status_gpio_mode != STATUS_GPIO_MODE_BUTTON) {
         gpio_on_connect();

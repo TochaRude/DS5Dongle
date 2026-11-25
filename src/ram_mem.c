@@ -65,6 +65,18 @@ void *__not_in_flash_func(memmove)(void *dst, const void *src, size_t n) {
     } else {
         d += n;
         s += n;
+        if ((((uintptr_t) d ^ (uintptr_t) s) & 3u) == 0u) {
+            while (n && (((uintptr_t) d & 3u) != 0u)) {
+                *--d = *--s;
+                --n;
+            }
+            uint32_t *dw = (uint32_t *) d;
+            const uint32_t *sw = (const uint32_t *) s;
+            for (size_t w = n >> 2; w; --w) *--dw = *--sw;
+            d = (uint8_t *) dw;
+            s = (const uint8_t *) sw;
+            n &= 3u;
+        }
         while (n--) *--d = *--s;
     }
     return dst;

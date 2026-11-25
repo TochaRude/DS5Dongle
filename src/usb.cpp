@@ -2,6 +2,9 @@
 // Created by awalol on 2026/3/4.
 //
 
+#include <algorithm>
+#include <cstring>
+
 #include "bt.h"
 #include "tusb.h"
 #include "bsp/board_api.h"
@@ -115,7 +118,7 @@ static bool audio10_set_req_entity(tusb_control_request_t const *p_request, uint
 
             case AUDIO10_FU_CTRL_VOLUME:
                 switch (p_request->bRequest) {
-                    case AUDIO10_CS_REQ_SET_CUR:
+                    case AUDIO10_CS_REQ_SET_CUR: {
                         // Only 1st form is supported
                         TU_VERIFY(p_request->wLength == 2);
 
@@ -125,26 +128,30 @@ static bool audio10_set_req_entity(tusb_control_request_t const *p_request, uint
                             return true;
                         }
 
-                        volume[index] = static_cast<float>(*reinterpret_cast<int16_t const *>(pBuff)) / 256;
+                        int16_t raw_vol = 0;
+                        memcpy(&raw_vol, pBuff, sizeof(raw_vol));
+                        volume[index] = static_cast<float>(raw_vol) / 256.0f;
                         if (entityID == UAC1_ENTITY_SPK_FEATURE_UNIT) {
+                            const uint8_t vol_ds = static_cast<uint8_t>(std::clamp(100.0f + volume[index], 0.0f, 127.0f));
                             SetStateData state = {
                                 .AllowHeadphoneVolume = 1,
                                 .AllowSpeakerVolume = 1,
-                                .VolumeHeadphones = static_cast<uint8_t>(100.0f + volume[index]),
-                                .VolumeSpeaker = static_cast<uint8_t>(100.0f + volume[index]),
+                                .VolumeHeadphones = vol_ds,
+                                .VolumeSpeaker = vol_ds,
                             };
                             update_state(state);
                         }
                         if (entityID == UAC1_ENTITY_MIC_FEATURE_UNIT) {
                             SetStateData state = {
                                 .AllowMicVolume = 1,
-                                .VolumeMic = static_cast<uint8_t>(volume[index]),
+                                .VolumeMic = static_cast<uint8_t>(std::clamp(volume[index], 0.0f, 64.0f)),
                             };
                             update_state(state);
                         }
 
-                        TU_LOG2("    Set Volume: %d dB of entity: %u\r\n", volume[index], entityID);
+                        TU_LOG2("    Set Volume: %d dB of entity: %u\r\n", static_cast<int>(volume[index]), entityID);
                         return true;
+                    }
 
                     default:
                         return false; // not supported
@@ -152,7 +159,6 @@ static bool audio10_set_req_entity(tusb_control_request_t const *p_request, uint
 
             // Unknown/Unsupported control
             default:
-                TU_BREAKPOINT();
                 return false;
         }
     }
@@ -181,7 +187,7 @@ static bool audio10_get_req_entity(uint8_t rhport, tusb_control_request_t const 
                         TU_LOG2("    Get Volume of entity: %u\r\n", entityID); {
                             // Report the last accepted value, including while
                             // locked; a read must not change the held volume.
-                            int16_t vol = volume[index] * 256; // convert to 1/256 dB units
+                            int16_t vol = static_cast<int16_t>(std::clamp(volume[index] * 256.0f, -32768.0f, 32767.0f)); // convert to 1/256 dB units
                             return tud_audio_buffer_and_schedule_control_xfer(rhport, p_request, &vol, sizeof(vol));
                         }
 
@@ -225,14 +231,12 @@ static bool audio10_get_req_entity(uint8_t rhport, tusb_control_request_t const 
                         }
                     // Unknown/Unsupported control
                     default:
-                        TU_BREAKPOINT();
                         return false;
                 }
                 break;
 
             // Unknown/Unsupported control
             default:
-                TU_BREAKPOINT();
                 return false;
         }
     }

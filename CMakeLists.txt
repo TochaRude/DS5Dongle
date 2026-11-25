@@ -43,15 +43,16 @@ else ()
         set(PICO_BOARD pico2_w CACHE STRING "Board type")
 endif ()
 
-# Diagnostic: confirm PICO_BOARD resolution actually applied. Build log will
-# show which board path was taken. Remove these once verified on hardware.
-message(STATUS "DS5Dongle build target -- PICO_BOARD=${PICO_BOARD}")
-message(STATUS "DS5Dongle build target -- PICO_W_BUILD=${PICO_W_BUILD}")
-message(STATUS "DS5Dongle build target -- WAVESHARE_RP2350B_PLUS_W_BUILD=${WAVESHARE_RP2350B_PLUS_W_BUILD}")
-message(STATUS "DS5Dongle build target -- PICO_BOARD_HEADER_DIRS=${PICO_BOARD_HEADER_DIRS}")
+message(STATUS "DS5Dongle target: PICO_BOARD=${PICO_BOARD}")
 #set(PICO_CYW43_SUPPORTED 1)
 #set(PICO_CYW43_ARCH_THREADSAFE_BACKGROUND 1)
 
+option(ENABLE_UART "Enable UART stdio printf output" ON)
+if (ENABLE_UART)
+        set(ENABLE_UART_VALUE 1)
+else ()
+        set(ENABLE_UART_VALUE 0)
+endif ()
 option(ENABLE_SERIAL "Enable USB CDC serial printf output" OFF)
 if (ENABLE_SERIAL)
         set(ENABLE_SERIAL_VALUE 1)
@@ -82,19 +83,13 @@ if (DISABLE_SPEAKER_PROC)
 else ()
         set(DISABLE_SPEAKER_PROC_VALUE 0)
 endif ()
-option(PICO_W_BUILD "Build for Rasberry Pi Pico W, audio is missing" OFF)
 if (PICO_W_BUILD)
         set(CYW43_PIO_CLOCK_DIV_VALUE 3)
         set(SYS_CLOCK_KHZ_VALUE 200000)
         set(DISABLE_SPEAKER_PROC_VALUE 1)
 else ()
-        if(DISABLE_SPEAKER_PROC_VALUE)
-            set(CYW43_PIO_CLOCK_DIV_VALUE 2)
-            set(SYS_CLOCK_KHZ_VALUE 150000)
-        else ()
-            set(CYW43_PIO_CLOCK_DIV_VALUE 2)
-            set(SYS_CLOCK_KHZ_VALUE 150000)
-        endif ()
+        set(CYW43_PIO_CLOCK_DIV_VALUE 2)
+        set(SYS_CLOCK_KHZ_VALUE 150000)
 endif ()
 
 
@@ -114,7 +109,6 @@ add_executable(ds5-bridge
         src/main.cpp
         src/usb.cpp
         src/audio.cpp
-        src/elastic.cpp
         src/bt.cpp
         src/button_functions.cpp
         src/config.cpp
@@ -144,28 +138,40 @@ target_include_directories(wdl_resampler PUBLIC
         lib/WDL/WDL
 )
 
-# Opus
-#set(OPUS_FIXED_POINT ON)
-add_subdirectory(lib/opus)
+# Opus (only needed when speaker/mic processing is enabled)
+if (NOT DISABLE_SPEAKER_PROC_VALUE)
+        target_sources(ds5-bridge PRIVATE src/elastic.cpp)
 
-# Phase A.3: Move libopus to RAM via .time_critical sections.
-# libopus is built by add_subdirectory(lib/opus); the target `opus` is defined in
-# the subdirectory's CMakeLists.txt, so we can't use POST_BUILD here. Instead we
-# use a stamp-file custom command + custom target that runs after opus is built
-# and before ds5-bridge links. Renames .text and .rodata of libopus.a to
-# .time_critical.* which the Pico SDK linker places in RAM (loaded from flash
-# at boot, executed from RAM at runtime). ~220 KB total relocated, ~5-6 ms boot
-# time impact for the flash-to-RAM copy.
-add_custom_command(
-    OUTPUT ${CMAKE_BINARY_DIR}/opus_ram_relocate.stamp
-    COMMAND ${CMAKE_OBJCOPY} --rename-section .text=.time_critical.opus_text --rename-section .rodata=.time_critical.opus_rodata --rename-section .rodata.str1.4=.time_critical.opus_strings $<TARGET_FILE:opus>
-    COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_BINARY_DIR}/opus_ram_relocate.stamp
-    DEPENDS $<TARGET_FILE:opus>
-    COMMENT "Phase A.3: relocating libopus to .time_critical.* sections"
-    VERBATIM
-)
-add_custom_target(opus_ram_relocate ALL DEPENDS ${CMAKE_BINARY_DIR}/opus_ram_relocate.stamp)
-add_dependencies(ds5-bridge opus_ram_relocate)
+        #set(OPUS_FIXED_POINT ON)
+        add_subdirectory(lib/opus)
+
+        # Phase A.3: Move libopus to RAM via .time_critical sections.
+        # libopus is built by add_subdirectory(lib/opus); the target `opus` is defined in
+        # the subdirectory's CMakeLists.txt, so we can't use POST_BUILD here. Instead we
+        # use a stamp-file custom command + custom target that runs after opus is built
+        # and before ds5-bridge links. Renames .text and .rodata* of libopus.a to
+        # .time_critical.* which the Pico SDK linker places in RAM (loaded from flash
+        # at boot, executed from RAM at runtime). ~220 KB total relocated, ~5-6 ms boot
+        # time impact for the flash-to-RAM copy.
+        add_custom_command(
+            OUTPUT ${CMAKE_BINARY_DIR}/opus_ram_relocate.stamp
+            COMMAND ${CMAKE_OBJCOPY}
+                --rename-section .text=.time_critical.opus_text
+                --rename-section .rodata=.time_critical.opus_rodata
+                --rename-section .rodata.str1.4=.time_critical.opus_strings
+                --rename-section .rodata.str1.1=.time_critical.opus_str1
+                --rename-section .rodata.cst4=.time_critical.opus_cst4
+                --rename-section .rodata.cst8=.time_critical.opus_cst8
+                $<TARGET_FILE:opus>
+            COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_BINARY_DIR}/opus_ram_relocate.stamp
+            DEPENDS $<TARGET_FILE:opus>
+            COMMENT "Phase A.3: relocating libopus to .time_critical.* sections"
+            VERBATIM
+        )
+        add_custom_target(opus_ram_relocate ALL DEPENDS ${CMAKE_BINARY_DIR}/opus_ram_relocate.stamp)
+        add_dependencies(ds5-bridge opus_ram_relocate)
+        target_link_libraries(ds5-bridge opus)
+endif ()
 
 target_compile_options(wdl_resampler PRIVATE -fsigned-char)
 
@@ -218,10 +224,10 @@ relocate_to_ram(lib/tinyusb/src/common/tusb_fifo.c.o
     ".text.tu_fifo_read=.time_critical.tu_fifo_read|.text.tu_fifo_read_n_access_mode=.time_critical.tu_fifo_read_n_access_mode|.text.tu_fifo_write=.time_critical.tu_fifo_write|.text.tu_fifo_write_n_access_mode=.time_critical.tu_fifo_write_n_access_mode"
     "Phase B.2: tusb_fifo.c data path -> RAM")
 relocate_to_ram(src/rp2_common/pico_cyw43_driver/cyw43_bus_pio_spi.c.o
-    ".text.cyw43_spi_transfer=.time_critical.cyw43_spi_transfer|.text.cyw43_read_bytes=.time_critical.cyw43_read_bytes|.text.cyw43_write_bytes=.time_critical.cyw43_write_bytes|.text.cyw43_read_reg_u32=.time_critical.cyw43_read_reg_u32|.text.cyw43_read_reg_u16=.time_critical.cyw43_read_reg_u16|.text.cyw43_read_reg_u8=.time_critical.cyw43_read_reg_u8|.text.cyw43_write_reg_u32=.time_critical.cyw43_write_reg_u32|.text.cyw43_write_reg_u16=.time_critical.cyw43_write_reg_u16|.text.cyw43_write_reg_u8=.time_critical.cyw43_write_reg_u8|.text.read_reg_u32_swap=.time_critical.read_reg_u32_swap|.text.write_reg_u32_swap=.time_critical.write_reg_u32_swap|.text.ns_delay.constprop.0=.time_critical.cyw43_ns_delay"
+    ".text.cyw43_spi_transfer=.time_critical.cyw43_spi_transfer|.text.cyw43_read_bytes=.time_critical.cyw43_read_bytes|.text.cyw43_write_bytes=.time_critical.cyw43_write_bytes|.text.cyw43_read_reg_u32=.time_critical.cyw43_read_reg_u32|.text.cyw43_read_reg_u16=.time_critical.cyw43_read_reg_u16|.text.cyw43_read_reg_u8=.time_critical.cyw43_read_reg_u8|.text.cyw43_write_reg_u32=.time_critical.cyw43_write_reg_u32|.text.cyw43_write_reg_u16=.time_critical.cyw43_write_reg_u16|.text.cyw43_write_reg_u8=.time_critical.cyw43_write_reg_u8|.text.read_reg_u32_swap=.time_critical.read_reg_u32_swap|.text.write_reg_u32_swap=.time_critical.write_reg_u32_swap|.text.ns_delay=.time_critical.cyw43_ns_delay_base|.text.ns_delay.constprop.0=.time_critical.cyw43_ns_delay|.text.ns_delay.isra.0=.time_critical.cyw43_ns_delay_isra"
     "Phase B.2: cyw43 PIO-SPI transport -> RAM")
 relocate_to_ram(lib/cyw43-driver/src/cyw43_ll.c.o
-    ".text.cyw43_ll_sdpcm_poll_device=.time_critical.cyw43_ll_sdpcm_poll_device|.text.cyw43_ll_process_packets=.time_critical.cyw43_ll_process_packets|.text.cyw43_sdpcm_send_common=.time_critical.cyw43_sdpcm_send_common|.text.cyw43_do_ioctl.part.0=.time_critical.cyw43_do_ioctl|.text.cyw43_ll_bt_has_work=.time_critical.cyw43_ll_bt_has_work|.text.cyw43_ll_parse_async_event=.time_critical.cyw43_ll_parse_async_event"
+    ".text.cyw43_ll_sdpcm_poll_device=.time_critical.cyw43_ll_sdpcm_poll_device|.text.cyw43_ll_process_packets=.time_critical.cyw43_ll_process_packets|.text.cyw43_sdpcm_send_common=.time_critical.cyw43_sdpcm_send_common|.text.cyw43_do_ioctl=.time_critical.cyw43_do_ioctl_base|.text.cyw43_do_ioctl.part.0=.time_critical.cyw43_do_ioctl|.text.cyw43_do_ioctl.constprop.0=.time_critical.cyw43_do_ioctl_cp|.text.cyw43_ll_bt_has_work=.time_critical.cyw43_ll_bt_has_work|.text.cyw43_ll_parse_async_event=.time_critical.cyw43_ll_parse_async_event"
     "Phase B.2: cyw43 SDPCM pump -> RAM")
 relocate_to_ram(lib/cyw43-driver/src/cyw43_ctrl.c.o
     ".text.cyw43_poll_func=.time_critical.cyw43_poll_func|.text.cyw43_bluetooth_hci_read=.time_critical.cyw43_bluetooth_hci_read|.text.cyw43_bluetooth_hci_write=.time_critical.cyw43_bluetooth_hci_write"
@@ -240,7 +246,7 @@ relocate_to_ram(lib/btstack/src/btstack_linked_list.c.o
     ".text.btstack_linked_list_iterator_init=.time_critical.btstack_linked_list_iterator_init|.text.btstack_linked_list_iterator_has_next=.time_critical.btstack_linked_list_iterator_has_next|.text.btstack_linked_list_iterator_next=.time_critical.btstack_linked_list_iterator_next"
     "Phase B.3: btstack linked-list iterators -> RAM")
 relocate_to_ram(lib/cyw43-driver/src/cyw43_ll.c.o
-    ".text.cyw43_ll_write_backplane_mem=.time_critical.cyw43_ll_write_backplane_mem|.text.cyw43_ll_read_backplane_mem=.time_critical.cyw43_ll_read_backplane_mem|.text.cyw43_write_backplane=.time_critical.cyw43_write_backplane|.text.cyw43_read_backplane.constprop.0=.time_critical.cyw43_read_backplane"
+    ".text.cyw43_ll_write_backplane_mem=.time_critical.cyw43_ll_write_backplane_mem|.text.cyw43_ll_read_backplane_mem=.time_critical.cyw43_ll_read_backplane_mem|.text.cyw43_write_backplane=.time_critical.cyw43_write_backplane|.text.cyw43_read_backplane=.time_critical.cyw43_read_backplane_base|.text.cyw43_read_backplane.constprop.0=.time_critical.cyw43_read_backplane|.text.cyw43_read_backplane.isra.0=.time_critical.cyw43_read_backplane_isra"
     "Phase B.3: cyw43 backplane accessors -> RAM")
 relocate_to_ram(lib/tinyusb/src/device/usbd.c.o
     ".text.tud_task_ext=.time_critical.tud_task_ext|.text.usbd_edpt_xfer=.time_critical.usbd_edpt_xfer|.text.usbd_edpt_xfer_fifo=.time_critical.usbd_edpt_xfer_fifo"
@@ -249,7 +255,7 @@ relocate_to_ram(lib/tinyusb/src/portable/raspberrypi/rp2040/dcd_rp2040.c.o
     ".text.dcd_edpt_xfer=.time_critical.dcd_edpt_xfer|.text.dcd_edpt_iso_activate=.time_critical.dcd_edpt_iso_activate"
     "Phase B.3: dcd_rp2040.c submit + iso -> RAM")
 relocate_to_ram(lib/tinyusb/src/class/audio/audio_device.c.o
-    ".text.tud_audio_n_read=.time_critical.tud_audio_n_read|.text.tud_audio_n_write=.time_critical.tud_audio_n_write|.text.audiod_calc_tx_packet_sz.isra.0=.time_critical.audiod_calc_tx_packet_sz|.text.audiod_xfer_isr=.time_critical.audiod_xfer_isr"
+    ".text.tud_audio_n_read=.time_critical.tud_audio_n_read|.text.tud_audio_n_write=.time_critical.tud_audio_n_write|.text.audiod_calc_tx_packet_sz=.time_critical.audiod_calc_tx_packet_sz_base|.text.audiod_calc_tx_packet_sz.isra.0=.time_critical.audiod_calc_tx_packet_sz|.text.audiod_calc_tx_packet_sz.constprop.0=.time_critical.audiod_calc_tx_packet_sz_cp|.text.audiod_xfer_isr=.time_critical.audiod_xfer_isr"
     "Phase B.3: audio_device.c data path -> RAM")
 
 # --- Phase B.4: input-report path tail (controller -> host) ---
@@ -334,7 +340,7 @@ pico_set_program_name(ds5-bridge "ds5-bridge")
 pico_set_program_version(ds5-bridge "${VERSION}")
 
 # Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(ds5-bridge 1)
+pico_enable_stdio_uart(ds5-bridge ${ENABLE_UART_VALUE})
 pico_enable_stdio_usb(ds5-bridge ${ENABLE_SERIAL_VALUE})
 
 # Add the standard include files to the build
@@ -360,7 +366,6 @@ target_link_libraries(ds5-bridge
         tinyusb_device
         tinyusb_board
         wdl_resampler
-        opus
 )
 
 pico_add_extra_outputs(ds5-bridge)

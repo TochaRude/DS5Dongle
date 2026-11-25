@@ -31,8 +31,13 @@ def main():
     if not cand:
         sys.exit("No DualSense / ds5dongle found (VID 054C, PID 0CE6/0DF2). "
                  "Close Steam/DSX if they're holding the device.")
+    gamepads = [
+        d for d in cand
+        if d.get("usage_page") == 0x01 and d.get("usage") == 0x05
+    ]
+    target = gamepads[0] if gamepads else cand[0]
     dev = hid.device()
-    dev.open_path(cand[0]["path"])
+    dev.open_path(target["path"])
 
     # [report id][funcid][padding...] -> 1 + DATA_LEN bytes total
     payload = bytes([REPORT_ID, FUNCID_REBOOT_BOOTSEL] + [0] * (DATA_LEN - 1))
